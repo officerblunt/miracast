@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="Miracast.Avalonia/Miracast.Avalonia.csproj" />
+  <Project Path="Miracast.Receiver.Linux/Miracast.Receiver.Linux.csproj" />
+  <Project Path="Miracast.Receiver.Windows/Miracast.Receiver.Windows.csproj" />
+  <Project Path="Miracast.Receiver/Miracast.Receiver.csproj" />
+</Solution>
