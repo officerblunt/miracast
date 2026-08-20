@@ -1,0 +1,40 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Miracast.Receiver", "Miracast.Receiver\Miracast.Receiver.csproj", "{62A3E59F-BE8E-476A-ADC5-01546330BDA0}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Miracast.Receiver.Windows", "Miracast.Receiver.Windows\Miracast.Receiver.Windows.csproj", "{F075CFDF-4127-4D16-80CB-68A062C22879}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Miracast.Receiver.Linux", "Miracast.Receiver.Linux\Miracast.Receiver.Linux.csproj", "{FA540734-E235-40E1-B4AC-F44AAB16D745}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Miracast.Avalonia", "Miracast.Avalonia\Miracast.Avalonia.csproj", "{8521D6BA-B439-4FD1-A357-D9611F0673E0}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{62A3E59F-BE8E-476A-ADC5-01546330BDA0}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{62A3E59F-BE8E-476A-ADC5-01546330BDA0}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{62A3E59F-BE8E-476A-ADC5-01546330BDA0}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{62A3E59F-BE8E-476A-ADC5-01546330BDA0}.Release|Any CPU.Build.0 = Release|Any CPU
+		{F075CFDF-4127-4D16-80CB-68A062C22879}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{F075CFDF-4127-4D16-80CB-68A062C22879}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{F075CFDF-4127-4D16-80CB-68A062C22879}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{F075CFDF-4127-4D16-80CB-68A062C22879}.Release|Any CPU.Build.0 = Release|Any CPU
+		{FA540734-E235-40E1-B4AC-F44AAB16D745}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{FA540734-E235-40E1-B4AC-F44AAB16D745}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{FA540734-E235-40E1-B4AC-F44AAB16D745}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{FA540734-E235-40E1-B4AC-F44AAB16D745}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8521D6BA-B439-4FD1-A357-D9611F0673E0}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{8521D6BA-B439-4FD1-A357-D9611F0673E0}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8521D6BA-B439-4FD1-A357-D9611F0673E0}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{8521D6BA-B439-4FD1-A357-D9611F0673E0}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

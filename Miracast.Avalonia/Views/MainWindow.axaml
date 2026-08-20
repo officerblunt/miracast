@@ -7,7 +7,10 @@
         x:Class="Miracast.Avalonia.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
         Icon="/Assets/avalonia-logo.ico"
-        Title="Miracast.Avalonia">
+        MinWidth="640"
+        MinHeight="360"
+        Background="Black"
+        Title="Miracast Receiver">
 
     <Design.DataContext>
         <!-- This only sets the DataContext for the previewer in an IDE,
@@ -15,6 +18,17 @@
         <vm:MainWindowViewModel/>
     </Design.DataContext>
 
-    <TextBlock Text="{Binding Greeting}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+    <Grid Background="Black">
+        <Image x:Name="FrameImage" Stretch="Uniform" />
+
+        <Border VerticalAlignment="Bottom"
+                Background="#B0000000"
+                Padding="16,10">
+            <TextBlock Text="{Binding Status}"
+                       Foreground="White"
+                       FontSize="14"
+                       TextWrapping="Wrap" />
+        </Border>
+    </Grid>
 
 </Window>

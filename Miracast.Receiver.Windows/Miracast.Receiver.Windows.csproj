@@ -1,13 +1,28 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <WindowsSdkNetRefVersion>10.0.26100.57</WindowsSdkNetRefVersion>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\Miracast.Receiver\Miracast.Receiver.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageDownload Include="Microsoft.Windows.SDK.NET.Ref" Version="[$(WindowsSdkNetRefVersion)]" />
+    <PackageReference Include="Vortice.Direct3D11" Version="3.8.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="Microsoft.Windows.SDK.NET"
+               HintPath="$(NuGetPackageRoot)microsoft.windows.sdk.net.ref\$(WindowsSdkNetRefVersion)\lib\net8.0\Microsoft.Windows.SDK.NET.dll"
+               Private="true" />
+    <Reference Include="WinRT.Runtime"
+               HintPath="$(NuGetPackageRoot)microsoft.windows.sdk.net.ref\$(WindowsSdkNetRefVersion)\lib\net8.0\WinRT.Runtime.dll"
+               Private="true" />
   </ItemGroup>
 
 </Project>

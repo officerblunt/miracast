@@ -2,5 +2,8 @@
 
 public interface IVideoRenderer
 {
-    Task PlayAsync(IVideoSource source);
+    event EventHandler<Entities.EventArgs.VideoFrameReceivedEventArgs>? FrameReceived;
+
+    Task PlayAsync(IVideoSource source, CancellationToken cancellationToken = default);
+    Task StopAsync();
 }

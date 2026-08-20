@@ -1,68 +1,107 @@
-﻿using Miracast.Receiver.Entities.EventArgs;
+using System.Runtime.Versioning;
+using Miracast.Receiver.Entities.EventArgs;
 using Windows.Media.Miracast;
 
 namespace Miracast.Receiver.Windows;
 
-public class MiracastReceiverService : IMiracastReceiverService
+[SupportedOSPlatform("windows10.0.18362")]
+public sealed class MiracastReceiverService : IMiracastReceiverService, IAsyncDisposable
 {
-    private MiracastReceiver? _miracastReceiver;
-    private MiracastReceiverSession? _miracastSession;
+    private readonly SemaphoreSlim _lifecycle = new(1, 1);
+    private MiracastReceiver? _receiver;
+    private MiracastReceiverSession? _session;
 
     public event EventHandler<ConnectionCreatedEventArgs>? ConnectionCreated;
     public event EventHandler<ConnectionClosedEventArgs>? ConnectionClosed;
     public event EventHandler<VideoReceivedEventArgs>? VideoReceived;
 
-    public MiracastReceiverService()
-    {
-        Task.Run(async () => await InitializeMiracastAsync()).Wait();
-    }
-
-    private async Task InitializeMiracastAsync()
-    {
-        _miracastReceiver = new();
-        _miracastReceiver.StatusChanged += (receiver, o) =>
-        {
-            Console.WriteLine($"StatusChanged: {receiver.GetStatus().ListeningStatus}");
-        };
-
-        var settings = _miracastReceiver.GetDefaultSettings();
-        
-        settings.FriendlyName += "officerblunt";
-        settings.AuthorizationMethod = MiracastReceiverAuthorizationMethod.None;
-        settings.RequireAuthorizationFromKnownTransmitters = false;
-        
-        var applyResult = await _miracastReceiver.DisconnectAllAndApplySettingsAsync(settings);
-        
-        Console.WriteLine($"DisconnectAllAndApplySettingsAsync={applyResult.Status}");
-
-
-        _miracastSession = await _miracastReceiver.CreateSessionAsync(null /* CoreApplication.MainView */);
-        Console.WriteLine($"CreateSession={_miracastSession}");
-        _miracastSession.AllowConnectionTakeover = true;
-        _miracastSession.ConnectionCreated += (session, args) =>
-        {
-            Console.WriteLine($"ConnectionCreated {args.Connection.Transmitter.Name}");
-        };
-        _miracastSession.Disconnected += (session, args) =>
-        {
-            Console.WriteLine($"Disconnected {args.Connection.Transmitter.Name}");
-        };
-        _miracastSession.MediaSourceCreated += (sender, args) => VideoReceived?.Invoke(this, new()
-        {
-            Source = new VideoSource(args.MediaSource)
-        });
-
-        var startResult = await _miracastSession.StartAsync();
-        Console.WriteLine($"Session.Start={startResult.Status}");
-    }
-
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
-        await InitializeMiracastAsync();
+        await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_session is not null)
+                return;
+
+            cancellationToken.ThrowIfCancellationRequested();
+            var receiver = new MiracastReceiver();
+            var settings = receiver.GetDefaultSettings();
+            settings.FriendlyName = $"{Environment.MachineName} Miracast";
+            settings.AuthorizationMethod = MiracastReceiverAuthorizationMethod.None;
+            settings.RequireAuthorizationFromKnownTransmitters = false;
+
+            var applyResult = await receiver.DisconnectAllAndApplySettingsAsync(settings);
+            if (applyResult.Status != MiracastReceiverApplySettingsStatus.Success)
+                throw new InvalidOperationException(
+                    $"Windows rejected the Miracast receiver settings: {applyResult.Status}. {applyResult.ExtendedError}");
+
+            cancellationToken.ThrowIfCancellationRequested();
+            // A desktop Avalonia app has no CoreApplicationView; null is the documented desktop-host value.
+            var session = await receiver.CreateSessionAsync(null);
+            session.AllowConnectionTakeover = true;
+            session.ConnectionCreated += OnConnectionCreated;
+            session.Disconnected += OnDisconnected;
+            session.MediaSourceCreated += OnMediaSourceCreated;
+
+            var startResult = await session.StartAsync();
+            if (startResult.Status != MiracastReceiverSessionStartStatus.Success)
+            {
+                session.Dispose();
+                throw new InvalidOperationException(
+                    $"Windows could not start the Miracast receiver: {startResult.Status}. {startResult.ExtendedError}");
+            }
+
+            _receiver = receiver;
+            _session = session;
+        }
+        finally
+        {
+            _lifecycle.Release();
+        }
     }
 
-    public Task StopAsync(CancellationToken cancellationToken = default)
+    public async Task StopAsync(CancellationToken cancellationToken = default)
     {
-        throw new NotImplementedException();
+        await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_session is null)
+                return;
+
+            _session.ConnectionCreated -= OnConnectionCreated;
+            _session.Disconnected -= OnDisconnected;
+            _session.MediaSourceCreated -= OnMediaSourceCreated;
+            _session.Dispose();
+            _session = null;
+            _receiver = null;
+        }
+        finally
+        {
+            _lifecycle.Release();
+        }
+    }
+
+    private void OnConnectionCreated(MiracastReceiverSession sender, MiracastReceiverConnectionCreatedEventArgs args) =>
+        ConnectionCreated?.Invoke(this, new ConnectionCreatedEventArgs
+        {
+            DeviceName = args.Connection.Transmitter.Name,
+        });
+
+    private void OnDisconnected(MiracastReceiverSession sender, MiracastReceiverDisconnectedEventArgs args) =>
+        ConnectionClosed?.Invoke(this, new ConnectionClosedEventArgs
+        {
+            DeviceName = args.Connection.Transmitter.Name,
+        });
+
+    private void OnMediaSourceCreated(MiracastReceiverSession sender, MiracastReceiverMediaSourceCreatedEventArgs args) =>
+        VideoReceived?.Invoke(this, new VideoReceivedEventArgs
+        {
+            Source = new VideoSource(args.MediaSource),
+        });
+
+    public async ValueTask DisposeAsync()
+    {
+        await StopAsync().ConfigureAwait(false);
+        _lifecycle.Dispose();
     }
 }

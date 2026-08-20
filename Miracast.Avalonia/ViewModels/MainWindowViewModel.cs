@@ -1,6 +1,9 @@
-﻿namespace Miracast.Avalonia.ViewModels;
+using CommunityToolkit.Mvvm.ComponentModel;
+
+namespace Miracast.Avalonia.ViewModels;
 
 public partial class MainWindowViewModel : ViewModelBase
 {
-    public string Greeting { get; } = "Welcome to Avalonia!";
+    [ObservableProperty]
+    private string _status = "Starting Miracast receiver…";
 }

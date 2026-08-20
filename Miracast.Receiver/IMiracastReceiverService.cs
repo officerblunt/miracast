@@ -4,10 +4,10 @@ namespace Miracast.Receiver;
 
 public interface IMiracastReceiverService
 {
-    public Task StartAsync(CancellationToken cancellationToken = default);
-    public Task StopAsync(CancellationToken cancellationToken = default);
+    Task StartAsync(CancellationToken cancellationToken = default);
+    Task StopAsync(CancellationToken cancellationToken = default);
 
-    public event EventHandler<ConnectionCreatedEventArgs> ConnectionCreated;
-    public event EventHandler<ConnectionClosedEventArgs> ConnectionClosed;
-    public event EventHandler<VideoReceivedEventArgs> VideoReceived;
+    event EventHandler<ConnectionCreatedEventArgs>? ConnectionCreated;
+    event EventHandler<ConnectionClosedEventArgs>? ConnectionClosed;
+    event EventHandler<VideoReceivedEventArgs>? VideoReceived;
 }

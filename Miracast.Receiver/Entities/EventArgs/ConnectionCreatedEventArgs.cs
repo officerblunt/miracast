@@ -1,6 +1,6 @@
-﻿namespace Miracast.Receiver.Entities.EventArgs;
+namespace Miracast.Receiver.Entities.EventArgs;
 
-public class ConnectionCreatedEventArgs
+public sealed class ConnectionCreatedEventArgs : System.EventArgs
 {
-    
+    public string? DeviceName { get; init; }
 }
