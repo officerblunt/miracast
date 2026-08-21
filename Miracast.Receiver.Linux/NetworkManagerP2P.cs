@@ -27,6 +27,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private INetworkManager? _networkManager;
     private IWpaSupplicant? _supplicant;
     private IWpaP2PDevice? _supplicantP2PDevice;
+    private IWpaWps? _supplicantWps;
     private IWifiP2PDevice? _p2pDevice;
     private ObjectPath _devicePath;
     private ObjectPath? _activeConnection;
@@ -39,7 +40,9 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private string? _previousP2PDeviceName;
     private byte[]? _previousPrimaryDeviceType;
     private uint? _previousGoIntent;
+    private string? _previousWpsConfigMethods;
     private bool _p2pDeviceConfigured;
+    private bool _wpsConfigured;
     private bool _incomingRequestSubscriptionsConfigured;
     private bool _disposed;
 
@@ -426,6 +429,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                     var existing = await candidate.GetAsync<IDictionary<string, object>>("P2PDeviceConfig")
                         .WaitAsync(cancellationToken).ConfigureAwait(false);
                     _supplicantP2PDevice = candidate;
+                    _supplicantWps = _bus.CreateProxy<IWpaWps>(SupplicantService, path);
                     if (existing.TryGetValue("DeviceName", out var name) && name is string deviceName)
                         _previousP2PDeviceName = deviceName;
                     if (existing.TryGetValue("PrimaryDeviceType", out var type) && type is byte[] primaryType)
@@ -454,15 +458,61 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         }).WaitAsync(cancellationToken).ConfigureAwait(false);
         _p2pDeviceConfigured = true;
 
+        var wps = _supplicantWps
+            ?? throw new InvalidOperationException(
+                "wpa_supplicant did not expose a WPS interface for the Wi-Fi adapter.");
+        if (!_wpsConfigured)
+        {
+            _previousWpsConfigMethods = await wps.GetAsync<string>("ConfigMethods")
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        // Windows normally pairs with a Miracast display without showing a PIN.
+        // Advertising PIN methods makes some Sources choose a flow that this
+        // unattended receiver cannot complete.
+        await wps.SetAsync("ConfigMethods", "push_button virtual_push_button")
+            .WaitAsync(cancellationToken).ConfigureAwait(false);
+        _wpsConfigured = true;
+
         if (!_incomingRequestSubscriptionsConfigured)
         {
             _subscriptions.Add(await p2pDevice.WatchProvisionDiscoveryPBCRequestAsync(
                 path => QueueIncomingConnection(path, "WPS Push Button request"),
                 exception => Report($"Could not monitor incoming WPS requests: {exception.Message}"))
                 .WaitAsync(cancellationToken).ConfigureAwait(false));
+            _subscriptions.Add(await p2pDevice.WatchProvisionDiscoveryRequestDisplayPinAsync(
+                request => ReportUnsupportedPinRequest(request.peer, "display", request.pin),
+                exception => Report($"Could not monitor incoming WPS display-PIN requests: {exception.Message}"))
+                .WaitAsync(cancellationToken).ConfigureAwait(false));
+            _subscriptions.Add(await p2pDevice.WatchProvisionDiscoveryRequestEnterPinAsync(
+                path => ReportUnsupportedPinRequest(path, "keypad"),
+                exception => Report($"Could not monitor incoming WPS keypad requests: {exception.Message}"))
+                .WaitAsync(cancellationToken).ConfigureAwait(false));
+            _subscriptions.Add(await p2pDevice.WatchProvisionDiscoveryPBCResponseAsync(
+                path => ReportPeerEvent(path, "accepted the WPS Push Button request"),
+                exception => Report($"Could not monitor WPS responses: {exception.Message}"))
+                .WaitAsync(cancellationToken).ConfigureAwait(false));
+            _subscriptions.Add(await p2pDevice.WatchProvisionDiscoveryResponseDisplayPinAsync(
+                request => ReportPeerEvent(request.peer, $"returned a WPS display PIN ({request.pin})"),
+                exception => Report($"Could not monitor WPS display-PIN responses: {exception.Message}"))
+                .WaitAsync(cancellationToken).ConfigureAwait(false));
+            _subscriptions.Add(await p2pDevice.WatchProvisionDiscoveryResponseEnterPinAsync(
+                path => ReportPeerEvent(path, "accepted a WPS keypad request"),
+                exception => Report($"Could not monitor WPS keypad responses: {exception.Message}"))
+                .WaitAsync(cancellationToken).ConfigureAwait(false));
+            _subscriptions.Add(await p2pDevice.WatchProvisionDiscoveryFailureAsync(
+                failure => ReportPeerEvent(
+                    failure.peer,
+                    $"reported a WPS provisioning failure (status {failure.status})"),
+                exception => Report($"Could not monitor WPS failures: {exception.Message}"))
+                .WaitAsync(cancellationToken).ConfigureAwait(false));
             _subscriptions.Add(await p2pDevice.WatchGONegotiationRequestAsync(
                 request => QueueIncomingConnection(request.path, "GO negotiation request"),
                 exception => Report($"Could not monitor incoming GO negotiation: {exception.Message}"))
+                .WaitAsync(cancellationToken).ConfigureAwait(false));
+            _subscriptions.Add(await p2pDevice.WatchGONegotiationFailureAsync(
+                properties => Report($"Wi-Fi Direct GO negotiation failed: {FormatProperties(properties)}"),
+                exception => Report($"Could not monitor GO negotiation failures: {exception.Message}"))
                 .WaitAsync(cancellationToken).ConfigureAwait(false));
             _incomingRequestSubscriptionsConfigured = true;
         }
@@ -488,9 +538,59 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             throw new InvalidOperationException("wpa_supplicant did not retain the Miracast Display device type.");
         }
 
+        var configMethods = await _supplicantWps!.GetAsync<string>("ConfigMethods")
+            .WaitAsync(cancellationToken).ConfigureAwait(false);
+        var wpsMethods = configMethods.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (!wpsMethods.Contains("push_button", StringComparer.Ordinal)
+            && !wpsMethods.Contains("virtual_push_button", StringComparer.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "wpa_supplicant did not retain the WPS Push Button pairing method.");
+        }
+
         Report(
-            $"Miracast receiver '{receiverName}' is advertising in P2P Listen mode. "
+            $"Miracast receiver '{receiverName}' is advertising in P2P Listen mode "
+            + "with WPS Push Button pairing. "
             + "Waiting for a Source to connect…");
+    }
+
+    private void ReportUnsupportedPinRequest(ObjectPath peerPath, string method, string? pin = null)
+    {
+        var pinText = string.IsNullOrEmpty(pin) ? string.Empty : $" (PIN {pin})";
+        ReportPeerEvent(
+            peerPath,
+            $"requested unsupported WPS {method}{pinText}; receiver is advertising Push Button only");
+    }
+
+    private void ReportPeerEvent(ObjectPath peerPath, string description)
+    {
+        var cancellationToken = _lifetime?.Token ?? CancellationToken.None;
+        _ = ReportPeerEventAsync(peerPath, description, cancellationToken);
+    }
+
+    private async Task ReportPeerEventAsync(
+        ObjectPath peerPath,
+        string description,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var peer = _bus.CreateProxy<IWpaPeer>(SupplicantService, peerPath);
+            var address = Convert.ToHexString(
+                await peer.GetAsync<byte[]>("DeviceAddress")
+                    .WaitAsync(cancellationToken).ConfigureAwait(false));
+            var name = _peersByAddress.TryGetValue(address, out var knownPeer)
+                ? knownPeer.Name
+                : address;
+            Report($"Wi-Fi Direct peer {name} {description}.");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            Report($"Wi-Fi Direct peer {peerPath} {description}; could not read peer details: {exception.Message}");
+        }
     }
 
     private void QueueIncomingConnection(ObjectPath supplicantPeerPath, string reason)
@@ -553,6 +653,11 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                 if (previousConfig.Count > 0)
                     await _supplicantP2PDevice.SetAsync("P2PDeviceConfig", previousConfig).ConfigureAwait(false);
             }
+            if (_wpsConfigured && _supplicantWps is not null && _previousWpsConfigMethods is not null)
+            {
+                await _supplicantWps.SetAsync("ConfigMethods", _previousWpsConfigMethods)
+                    .ConfigureAwait(false);
+            }
             if (_wfdAdvertisementConfigured && _supplicant is not null)
             {
                 await _supplicant.SetAsync("WFDIEs", _previousWfdInformationElements ?? [])
@@ -568,13 +673,21 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             _wfdAdvertisementConfigured = false;
             _previousWfdInformationElements = null;
             _p2pDeviceConfigured = false;
+            _wpsConfigured = false;
             _incomingRequestSubscriptionsConfigured = false;
             _supplicantP2PDevice = null;
+            _supplicantWps = null;
             _previousP2PDeviceName = null;
             _previousPrimaryDeviceType = null;
             _previousGoIntent = null;
+            _previousWpsConfigMethods = null;
         }
     }
+
+    private static string FormatProperties(IDictionary<string, object> properties) =>
+        properties.Count == 0
+            ? "no details"
+            : string.Join(", ", properties.Select(pair => $"{pair.Key}={pair.Value}"));
 
     private static bool IsSupplicantTemporarilyUnavailable(DBusException exception) =>
         exception.ErrorName is DeviceNotActiveError
@@ -732,9 +845,37 @@ public interface IWpaP2PDevice : IDBusObject
     Task<IDisposable> WatchProvisionDiscoveryPBCRequestAsync(
         Action<ObjectPath> handler,
         Action<Exception>? onError = null);
+    Task<IDisposable> WatchProvisionDiscoveryPBCResponseAsync(
+        Action<ObjectPath> handler,
+        Action<Exception>? onError = null);
+    Task<IDisposable> WatchProvisionDiscoveryRequestDisplayPinAsync(
+        Action<(ObjectPath peer, string pin)> handler,
+        Action<Exception>? onError = null);
+    Task<IDisposable> WatchProvisionDiscoveryResponseDisplayPinAsync(
+        Action<(ObjectPath peer, string pin)> handler,
+        Action<Exception>? onError = null);
+    Task<IDisposable> WatchProvisionDiscoveryRequestEnterPinAsync(
+        Action<ObjectPath> handler,
+        Action<Exception>? onError = null);
+    Task<IDisposable> WatchProvisionDiscoveryResponseEnterPinAsync(
+        Action<ObjectPath> handler,
+        Action<Exception>? onError = null);
+    Task<IDisposable> WatchProvisionDiscoveryFailureAsync(
+        Action<(ObjectPath peer, int status)> handler,
+        Action<Exception>? onError = null);
     Task<IDisposable> WatchGONegotiationRequestAsync(
         Action<(ObjectPath path, ushort devicePasswordId, byte deviceGoIntent)> handler,
         Action<Exception>? onError = null);
+    Task<IDisposable> WatchGONegotiationFailureAsync(
+        Action<IDictionary<string, object>> handler,
+        Action<Exception>? onError = null);
+}
+
+[DBusInterface("fi.w1.wpa_supplicant1.Interface.WPS")]
+public interface IWpaWps : IDBusObject
+{
+    Task<T> GetAsync<T>(string property);
+    Task SetAsync(string property, object value);
 }
 
 [DBusInterface("fi.w1.wpa_supplicant1.Peer")]
