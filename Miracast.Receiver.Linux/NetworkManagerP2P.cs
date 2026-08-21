@@ -9,6 +9,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private const uint WifiP2PDeviceType = 30;
     private const uint DeviceStateActivated = 100;
     private const uint DeviceStateFailed = 120;
+    private const string DeviceNotActiveError = "org.freedesktop.NetworkManager.Device.NotActive";
     private static readonly byte[] SinkWfdInformationElements =
         [0x00, 0x00, 0x06, 0x00, 0x11, 0x1c, 0x44, 0x00, 0xc8];
 
@@ -314,12 +315,32 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         if (_p2pDevice is null || cancellationToken.IsCancellationRequested)
             return;
         _shouldFind = true;
-        await _p2pDevice.StartFindAsync(new Dictionary<string, object>
+        var waitingReported = false;
+        while (_shouldFind && !cancellationToken.IsCancellationRequested)
         {
-            ["timeout"] = 600,
-        }).WaitAsync(cancellationToken).ConfigureAwait(false);
-        _finding = true;
-        Report("Searching for Miracast / Wi-Fi Display devices…");
+            try
+            {
+                await _p2pDevice.StartFindAsync(new Dictionary<string, object>
+                {
+                    ["timeout"] = 600,
+                }).WaitAsync(cancellationToken).ConfigureAwait(false);
+                _finding = true;
+                Report("Searching for Miracast / Wi-Fi Display devices…");
+                return;
+            }
+            catch (DBusException exception) when (exception.ErrorName == DeviceNotActiveError)
+            {
+                _finding = false;
+                if (!waitingReported)
+                {
+                    Report(
+                        "Wi-Fi Direct is waiting for NetworkManager's wpa_supplicant interface. "
+                        + "Keep NetworkManager and wpa_supplicant running and make sure Wi-Fi is enabled.");
+                    waitingReported = true;
+                }
+                await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken).ConfigureAwait(false);
+            }
+        }
     }
 
     private async Task RenewDiscoveryAsync(CancellationToken cancellationToken)
@@ -330,11 +351,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             {
                 await Task.Delay(TimeSpan.FromMinutes(9), cancellationToken).ConfigureAwait(false);
                 if (_shouldFind && _p2pDevice is not null)
-                {
-                    await _p2pDevice.StartFindAsync(new Dictionary<string, object> { ["timeout"] = 600 })
-                        .WaitAsync(cancellationToken).ConfigureAwait(false);
-                    _finding = true;
-                }
+                    await StartDiscoveryAsync(cancellationToken).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
