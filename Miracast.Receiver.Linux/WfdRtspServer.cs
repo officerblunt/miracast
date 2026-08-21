@@ -45,7 +45,7 @@ internal sealed class WfdRtspServer : IAsyncDisposable
                 {
                     await RunSessionAsync(client, cancellationToken).ConfigureAwait(false);
                 }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                catch (OperationCanceledException)
                 {
                 }
                 catch (Exception exception)
@@ -61,11 +61,27 @@ internal sealed class WfdRtspServer : IAsyncDisposable
                 }
             }
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        // AcceptTcpClientAsync may surface cancellation before the linked token's
+        // IsCancellationRequested value is observable on this continuation.
+        // Cancellation is always a normal terminal condition for this loop because
+        // this is the only token passed to the accept operation.
+        catch (OperationCanceledException)
         {
         }
-        catch (ObjectDisposedException) when (cancellationToken.IsCancellationRequested)
+        catch (ObjectDisposedException) when (!_started || cancellationToken.IsCancellationRequested)
         {
+        }
+        catch (SocketException exception) when (
+            !_started
+            || cancellationToken.IsCancellationRequested
+            || exception.SocketErrorCode is SocketError.OperationAborted or SocketError.Interrupted)
+        {
+        }
+        catch (Exception exception)
+        {
+            // The accept loop is a background task. Observe and report unexpected
+            // failures here so they cannot become an unobserved task exception.
+            Report($"WFD RTSP listener stopped unexpectedly: {exception.Message}");
         }
     }
 
