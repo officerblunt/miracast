@@ -350,13 +350,13 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         {
             try
             {
+                if (_finding)
+                    await StopFindAsync(disable: false).ConfigureAwait(false);
                 await ConfigureWfdAdvertisementAsync(cancellationToken).ConfigureAwait(false);
-                await _p2pDevice.StartFindAsync(new Dictionary<string, object>
-                {
-                    ["timeout"] = 600,
-                }).WaitAsync(cancellationToken).ConfigureAwait(false);
-                // NetworkManager may update supplicant P2P settings when Find starts.
-                // Re-apply and verify the Sink identity used by subsequent Probe Responses.
+                var p2pDevice = _supplicantP2PDevice
+                    ?? throw new InvalidOperationException("The wpa_supplicant P2PDevice proxy is not available.");
+                await p2pDevice.ListenAsync(600).WaitAsync(cancellationToken).ConfigureAwait(false);
+                // Re-apply and verify the Sink identity used by Probe Responses in Listen state.
                 await ConfigureWfdAdvertisementAsync(cancellationToken).ConfigureAwait(false);
                 await VerifyWfdAdvertisementAsync(cancellationToken).ConfigureAwait(false);
                 _finding = true;
@@ -488,7 +488,9 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             throw new InvalidOperationException("wpa_supplicant did not retain the Miracast Display device type.");
         }
 
-        Report($"Miracast receiver '{receiverName}' is discoverable. Waiting for a Source to connect…");
+        Report(
+            $"Miracast receiver '{receiverName}' is advertising in P2P Listen mode. "
+            + "Waiting for a Source to connect…");
     }
 
     private void QueueIncomingConnection(ObjectPath supplicantPeerPath, string reason)
@@ -629,10 +631,13 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     {
         if (disable)
             _shouldFind = false;
-        if (!_finding || _p2pDevice is null)
+        if (!_finding)
             return;
-        try { await _p2pDevice.StopFindAsync().ConfigureAwait(false); }
-        catch (Exception exception) { Report($"Could not stop P2P discovery: {exception.Message}"); }
+        if (_supplicantP2PDevice is not null)
+        {
+            try { await _supplicantP2PDevice.StopFindAsync().ConfigureAwait(false); }
+            catch (Exception exception) { Report($"Could not stop P2P listen: {exception.Message}"); }
+        }
         _finding = false;
     }
 
@@ -720,6 +725,8 @@ public interface IWpaSupplicant : IDBusObject
 [DBusInterface("fi.w1.wpa_supplicant1.Interface.P2PDevice")]
 public interface IWpaP2PDevice : IDBusObject
 {
+    Task ListenAsync(int timeout);
+    Task StopFindAsync();
     Task<T> GetAsync<T>(string property);
     Task SetAsync(string property, object value);
     Task<IDisposable> WatchProvisionDiscoveryPBCRequestAsync(
