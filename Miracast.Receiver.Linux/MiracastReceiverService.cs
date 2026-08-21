@@ -2,7 +2,10 @@ using Miracast.Receiver.Entities.EventArgs;
 
 namespace Miracast.Receiver.Linux;
 
-public sealed class MiracastReceiverService : IMiracastReceiverService, IAsyncDisposable
+public sealed class MiracastReceiverService :
+    IMiracastReceiverService,
+    IMiracastConnectionApprover,
+    IAsyncDisposable
 {
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private readonly IVideoRenderer _videoRenderer;
@@ -19,6 +22,7 @@ public sealed class MiracastReceiverService : IMiracastReceiverService, IAsyncDi
     public event EventHandler<ConnectionClosedEventArgs>? ConnectionClosed;
     public event EventHandler<VideoReceivedEventArgs>? VideoReceived;
     public event EventHandler<ReceiverStatusChangedEventArgs>? StatusChanged;
+    public event EventHandler<MiracastSourceChangedEventArgs>? SourceChanged;
 
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
@@ -36,6 +40,8 @@ public sealed class MiracastReceiverService : IMiracastReceiverService, IAsyncDi
             _networkManager.StatusChanged += OnInternalStatusChanged;
             _networkManager.PeerConnected += OnPeerConnected;
             _networkManager.PeerDisconnected += OnPeerDisconnected;
+            _networkManager.PeerAvailable += OnPeerAvailable;
+            _networkManager.PeerUnavailable += OnPeerUnavailable;
             await _networkManager.StartAsync(_lifetime.Token).ConfigureAwait(false);
             _started = true;
         }
@@ -88,6 +94,8 @@ public sealed class MiracastReceiverService : IMiracastReceiverService, IAsyncDi
             _networkManager.StatusChanged -= OnInternalStatusChanged;
             _networkManager.PeerConnected -= OnPeerConnected;
             _networkManager.PeerDisconnected -= OnPeerDisconnected;
+            _networkManager.PeerAvailable -= OnPeerAvailable;
+            _networkManager.PeerUnavailable -= OnPeerUnavailable;
             await _networkManager.DisposeAsync().ConfigureAwait(false);
             _networkManager = null;
         }
@@ -171,6 +179,32 @@ public sealed class MiracastReceiverService : IMiracastReceiverService, IAsyncDi
     }
 
     private void OnInternalStatusChanged(object? sender, string status) => Report(status);
+
+    private void OnPeerAvailable(object? sender, WifiP2PPeer peer) =>
+        ReportSource(peer, isAvailable: true);
+
+    private void OnPeerUnavailable(object? sender, WifiP2PPeer peer) =>
+        ReportSource(peer, isAvailable: false);
+
+    private void ReportSource(WifiP2PPeer peer, bool isAvailable) =>
+        SourceChanged?.Invoke(this, new MiracastSourceChangedEventArgs
+        {
+            Source = new MiracastSourceInfo(
+                peer.HardwareAddress,
+                peer.Name,
+                peer.HardwareAddress,
+                peer.Strength),
+            IsAvailable = isAvailable,
+        });
+
+    public Task ApproveConnectionAsync(
+        string sourceId,
+        CancellationToken cancellationToken = default)
+    {
+        var networkManager = _networkManager
+            ?? throw new InvalidOperationException("The Miracast receiver is not running.");
+        return networkManager.ApproveConnectionAsync(sourceId, cancellationToken);
+    }
 
     private void Report(string status) =>
         StatusChanged?.Invoke(this, new ReceiverStatusChangedEventArgs { Status = status });

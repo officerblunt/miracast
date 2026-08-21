@@ -50,6 +50,8 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     public event EventHandler<P2PConnectionContext>? PeerConnected;
     public event EventHandler? PeerDisconnected;
     public event EventHandler<string>? StatusChanged;
+    public event EventHandler<WifiP2PPeer>? PeerAvailable;
+    public event EventHandler<WifiP2PPeer>? PeerUnavailable;
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
@@ -124,6 +126,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             var address = NormalizeHardwareAddress(peer.HardwareAddress);
             _peersByAddress[address] = peer;
             _peerAddressesByPath[path.ToString()] = address;
+            PeerAvailable?.Invoke(this, peer);
             if (!_connecting)
                 Report($"Found {peer.Name} ({peer.HardwareAddress}), signal {peer.Strength}%.");
         }
@@ -138,10 +141,26 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
 
     private void OnPeerRemoved(ObjectPath path)
     {
-        if (_peerAddressesByPath.TryRemove(path.ToString(), out var address))
-            _peersByAddress.TryRemove(address, out _);
+        if (_peerAddressesByPath.TryRemove(path.ToString(), out var address)
+            && _peersByAddress.TryRemove(address, out var peer))
+        {
+            PeerUnavailable?.Invoke(this, peer);
+        }
         if (!_connecting)
             Report($"Wi-Fi P2P peer disappeared: {path}");
+    }
+
+    public async Task ApproveConnectionAsync(string sourceId, CancellationToken cancellationToken)
+    {
+        var address = NormalizeHardwareAddress(sourceId);
+        if (!_peersByAddress.TryGetValue(address, out var peer))
+        {
+            throw new InvalidOperationException(
+                "The selected Miracast Source is no longer visible. Refresh discovery and try again.");
+        }
+
+        Report($"Connection from {peer.Name} was approved on the receiver.");
+        await ConnectAsync(peer, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task ConnectAsync(WifiP2PPeer peer, CancellationToken cancellationToken)
