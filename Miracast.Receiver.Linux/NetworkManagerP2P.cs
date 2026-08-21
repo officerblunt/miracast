@@ -1,3 +1,4 @@
+using System.Net;
 using Tmds.DBus;
 
 namespace Miracast.Receiver.Linux;
@@ -8,6 +9,8 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private const uint WifiP2PDeviceType = 30;
     private const uint DeviceStateActivated = 100;
     private const uint DeviceStateFailed = 120;
+    private static readonly byte[] SinkWfdInformationElements =
+        [0x00, 0x00, 0x06, 0x00, 0x11, 0x1c, 0x44, 0x00, 0xc8];
 
     private readonly Connection _bus = new(Address.System);
     private readonly SemaphoreSlim _connectGate = new(1, 1);
@@ -22,7 +25,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private bool _shouldFind;
     private bool _disposed;
 
-    public event EventHandler<WifiP2PPeer>? PeerConnected;
+    public event EventHandler<P2PConnectionContext>? PeerConnected;
     public event EventHandler? PeerDisconnected;
     public event EventHandler<string>? StatusChanged;
 
@@ -131,7 +134,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                 ["wifi-p2p"] = new Dictionary<string, object>
                 {
                     ["peer"] = peer.HardwareAddress,
-                    ["wfd-ies"] = peer.WfdIEs,
+                    ["wfd-ies"] = SinkWfdInformationElements,
                     ["wps-method"] = 0x4u,
                 },
             };
@@ -165,7 +168,8 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
 
             await activated.Task.WaitAsync(TimeSpan.FromSeconds(90), cancellationToken).ConfigureAwait(false);
             await StopFindAsync(disable: true).ConfigureAwait(false);
-            PeerConnected?.Invoke(this, peer);
+            var context = await CreateConnectionContextAsync(device, peer, cancellationToken).ConfigureAwait(false);
+            PeerConnected?.Invoke(this, context);
         }
         catch
         {
@@ -206,6 +210,103 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         }
         _lifetime?.Dispose();
         _lifetime = null;
+    }
+
+    public async Task DisconnectCurrentAsync()
+    {
+        if (_activeConnection is not { } active || _networkManager is null)
+            return;
+
+        _activeConnection = null;
+        try
+        {
+            await _networkManager.DeactivateConnectionAsync(active).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            Report($"Could not deactivate the P2P connection: {exception.Message}");
+        }
+    }
+
+    private async Task<P2PConnectionContext> CreateConnectionContextAsync(
+        INetworkManagerDevice device,
+        WifiP2PPeer peer,
+        CancellationToken cancellationToken)
+    {
+        var interfaceName = await device.GetAsync<string>("Interface")
+            .WaitAsync(cancellationToken).ConfigureAwait(false);
+        var ip4Path = await device.GetAsync<ObjectPath>("Ip4Config")
+            .WaitAsync(cancellationToken).ConfigureAwait(false);
+        if (ip4Path.ToString() == "/")
+            throw new InvalidOperationException("NetworkManager activated P2P without an IPv4 configuration.");
+
+        var ip4Config = _bus.CreateProxy<INetworkManagerIP4Config>(Service, ip4Path);
+        var properties = await ip4Config.GetAllAsync().WaitAsync(cancellationToken).ConfigureAwait(false);
+        var localAddress = GetLocalAddress(properties)
+            ?? throw new InvalidOperationException("NetworkManager did not provide the receiver IPv4 address.");
+        var sourceAddress = GetIpAddress(properties, "Gateway")
+            ?? throw new InvalidOperationException("NetworkManager did not provide the Miracast Source IPv4 address.");
+        var controlPort = GetWfdControlPort(peer.WfdIEs);
+
+        Report($"P2P ready on {interfaceName}: {localAddress} → {sourceAddress}:{controlPort}.");
+        return new P2PConnectionContext(peer, interfaceName, localAddress, sourceAddress, controlPort);
+    }
+
+    private static IPAddress? GetLocalAddress(IDictionary<string, object> properties)
+    {
+        if (!properties.TryGetValue("AddressData", out var value))
+            return null;
+
+        if (value is IDictionary<string, object>[] addresses)
+        {
+            foreach (var address in addresses)
+            {
+                if (address.TryGetValue("address", out var text)
+                    && text is string ip
+                    && IPAddress.TryParse(ip, out var parsed))
+                {
+                    return parsed;
+                }
+            }
+        }
+        else if (value is IEnumerable<IDictionary<string, object>> addressSequence)
+        {
+            foreach (var address in addressSequence)
+            {
+                if (address.TryGetValue("address", out var text)
+                    && text is string ip
+                    && IPAddress.TryParse(ip, out var parsed))
+                {
+                    return parsed;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static IPAddress? GetIpAddress(IDictionary<string, object> properties, string name) =>
+        properties.TryGetValue(name, out var value)
+        && value is string text
+        && IPAddress.TryParse(text, out var address)
+            ? address
+            : null;
+
+    private static int GetWfdControlPort(ReadOnlySpan<byte> informationElements)
+    {
+        for (var offset = 0; offset + 8 < informationElements.Length; offset++)
+        {
+            if (informationElements[offset] != 0
+                || informationElements[offset + 1] != 0
+                || informationElements[offset + 2] != 6)
+            {
+                continue;
+            }
+
+            var port = (informationElements[offset + 5] << 8) | informationElements[offset + 6];
+            if (port > 0)
+                return port;
+        }
+        return 7236;
     }
 
     private async Task StartDiscoveryAsync(CancellationToken cancellationToken)
@@ -292,6 +393,13 @@ internal sealed record WifiP2PPeer(
     byte Strength,
     byte[] WfdIEs);
 
+internal sealed record P2PConnectionContext(
+    WifiP2PPeer Peer,
+    string InterfaceName,
+    IPAddress LocalAddress,
+    IPAddress SourceAddress,
+    int WfdControlPort);
+
 [DBusInterface("org.freedesktop.NetworkManager")]
 internal interface INetworkManager : IDBusObject
 {
@@ -324,6 +432,12 @@ internal interface IWifiP2PDevice : IDBusObject
 
 [DBusInterface("org.freedesktop.NetworkManager.WifiP2PPeer")]
 internal interface IWifiP2PPeer : IDBusObject
+{
+    Task<IDictionary<string, object>> GetAllAsync();
+}
+
+[DBusInterface("org.freedesktop.NetworkManager.IP4Config")]
+internal interface INetworkManagerIP4Config : IDBusObject
 {
     Task<IDictionary<string, object>> GetAllAsync();
 }

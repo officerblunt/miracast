@@ -1,6 +1,6 @@
 ﻿namespace Miracast.Receiver.Linux;
 
-public sealed class VideoSource(Uri streamUri, int width, int height) : IVideoSource
+public sealed class VideoSource(Uri streamUri, int width, int height) : IPreparedVideoSource
 {
     public Uri StreamUri { get; } = streamUri;
     public int Width { get; } = width;

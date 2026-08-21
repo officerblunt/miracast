@@ -5,11 +5,15 @@ namespace Miracast.Receiver.Linux;
 public sealed class MiracastReceiverService : IMiracastReceiverService, IAsyncDisposable
 {
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
+    private readonly IVideoRenderer _videoRenderer;
     private NetworkManagerP2P? _networkManager;
-    private WfdRtspServer? _rtspServer;
+    private WfdSession? _wfdSession;
+    private Task? _sessionTask;
     private CancellationTokenSource? _lifetime;
     private WifiP2PPeer? _connectedPeer;
     private bool _started;
+
+    public MiracastReceiverService(IVideoRenderer videoRenderer) => _videoRenderer = videoRenderer;
 
     public event EventHandler<ConnectionCreatedEventArgs>? ConnectionCreated;
     public event EventHandler<ConnectionClosedEventArgs>? ConnectionClosed;
@@ -28,12 +32,6 @@ public sealed class MiracastReceiverService : IMiracastReceiverService, IAsyncDi
                 return;
 
             _lifetime = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            _rtspServer = new WfdRtspServer();
-            _rtspServer.StatusChanged += OnInternalStatusChanged;
-            _rtspServer.StreamReady += OnStreamReady;
-            _rtspServer.SessionClosed += OnRtspSessionClosed;
-            _rtspServer.Start(_lifetime.Token);
-
             _networkManager = new NetworkManagerP2P();
             _networkManager.StatusChanged += OnInternalStatusChanged;
             _networkManager.PeerConnected += OnPeerConnected;
@@ -70,6 +68,21 @@ public sealed class MiracastReceiverService : IMiracastReceiverService, IAsyncDi
         _started = false;
         _lifetime?.Cancel();
 
+        var sessionTask = _sessionTask;
+        if (sessionTask is not null)
+        {
+            try { await sessionTask.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+            catch { }
+            _sessionTask = null;
+        }
+
+        if (_wfdSession is not null)
+        {
+            await _wfdSession.DisposeAsync().ConfigureAwait(false);
+            _wfdSession = null;
+        }
+
         if (_networkManager is not null)
         {
             _networkManager.StatusChanged -= OnInternalStatusChanged;
@@ -79,45 +92,74 @@ public sealed class MiracastReceiverService : IMiracastReceiverService, IAsyncDi
             _networkManager = null;
         }
 
-        if (_rtspServer is not null)
-        {
-            _rtspServer.StatusChanged -= OnInternalStatusChanged;
-            _rtspServer.StreamReady -= OnStreamReady;
-            _rtspServer.SessionClosed -= OnRtspSessionClosed;
-            await _rtspServer.DisposeAsync().ConfigureAwait(false);
-            _rtspServer = null;
-        }
-
         _lifetime?.Dispose();
         _lifetime = null;
-        _connectedPeer = null;
+        CloseConnection();
     }
 
-    private void OnPeerConnected(object? sender, WifiP2PPeer peer)
+    private void OnPeerConnected(object? sender, P2PConnectionContext connection)
     {
-        _connectedPeer = peer;
-        ConnectionCreated?.Invoke(this, new ConnectionCreatedEventArgs { DeviceName = peer.Name });
-        Report($"Connected to {peer.Name}. Waiting for WFD/RTSP negotiation…");
+        var lifetime = _lifetime;
+        if (lifetime is null || lifetime.IsCancellationRequested || _sessionTask is not null)
+            return;
+
+        _connectedPeer = connection.Peer;
+        ConnectionCreated?.Invoke(this, new ConnectionCreatedEventArgs { DeviceName = connection.Peer.Name });
+        Report($"Connected to {connection.Peer.Name}. Starting WFD/RTSP negotiation…");
+        _sessionTask = RunWfdSessionAsync(connection, lifetime.Token);
     }
 
-    private void OnPeerDisconnected(object? sender, EventArgs args) => CloseConnection();
-
-    private void OnRtspSessionClosed(object? sender, EventArgs args)
+    private async Task RunWfdSessionAsync(P2PConnectionContext connection, CancellationToken cancellationToken)
     {
-        if (_connectedPeer is not null)
-            Report("RTSP session closed; waiting for the P2P connection to end…");
-    }
-
-    private void OnStreamReady(object? sender, EventArgs args)
-    {
-        VideoReceived?.Invoke(this, new VideoReceivedEventArgs
+        var session = new WfdSession(connection, _videoRenderer, OnMediaReady, Report);
+        _wfdSession = session;
+        try
         {
-            Source = new VideoSource(
-                new Uri($"rtp://@0.0.0.0:{WfdRtspServer.RtpPort}"),
-                WfdRtspServer.OutputWidth,
-                WfdRtspServer.OutputHeight),
-        });
+            await session.RunAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            Report($"WFD session failed: {exception.Message}");
+        }
+        finally
+        {
+            await session.DisposeAsync().ConfigureAwait(false);
+            if (ReferenceEquals(_wfdSession, session))
+                _wfdSession = null;
+            CloseConnection();
+
+            var networkManager = _networkManager;
+            if (networkManager is not null && !cancellationToken.IsCancellationRequested)
+                await networkManager.DisconnectCurrentAsync().ConfigureAwait(false);
+            _sessionTask = null;
+        }
     }
+
+    private void OnPeerDisconnected(object? sender, EventArgs args)
+    {
+        CloseConnection();
+        var session = _wfdSession;
+        if (session is not null)
+            _ = StopWfdAfterPeerDisconnectAsync(session);
+    }
+
+    private async Task StopWfdAfterPeerDisconnectAsync(WfdSession session)
+    {
+        try
+        {
+            await session.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            Report($"Could not stop the disconnected WFD session: {exception.Message}");
+        }
+    }
+
+    private void OnMediaReady(VideoSource source) =>
+        VideoReceived?.Invoke(this, new VideoReceivedEventArgs { Source = source });
 
     private void CloseConnection()
     {

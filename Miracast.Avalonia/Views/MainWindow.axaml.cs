@@ -76,7 +76,8 @@ public partial class MainWindow : Window
     {
         try
         {
-            await _videoRenderer.PlayAsync(args.Source, _lifetime.Token);
+            if (args.Source is not IPreparedVideoSource)
+                await _videoRenderer.PlayAsync(args.Source, _lifetime.Token);
             SetStatus("Streaming");
         }
         catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)

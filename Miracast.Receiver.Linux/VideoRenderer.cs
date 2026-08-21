@@ -1,5 +1,7 @@
 using System.Buffers;
 using System.Diagnostics;
+using System.Net;
+using System.Net.Sockets;
 using Miracast.Receiver.Entities.EventArgs;
 
 namespace Miracast.Receiver.Linux;
@@ -12,9 +14,18 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
     private Task? _framePump;
     private Task? _errorPump;
     private int _framePending;
+    private long _lastFrameUnixTimeMilliseconds;
     private bool _disposed;
 
     public event EventHandler<VideoFrameReceivedEventArgs>? FrameReceived;
+    public DateTimeOffset? LastFrameReceivedAt
+    {
+        get
+        {
+            var value = Interlocked.Read(ref _lastFrameUnixTimeMilliseconds);
+            return value == 0 ? null : DateTimeOffset.FromUnixTimeMilliseconds(value);
+        }
+    }
 
     public async Task PlayAsync(IVideoSource source, CancellationToken cancellationToken = default)
     {
@@ -45,6 +56,7 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
             }
 
             _gstreamer = process;
+            Interlocked.Exchange(ref _lastFrameUnixTimeMilliseconds, 0);
             _playback = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             _framePump = PumpFramesAsync(process, linuxSource, _playback.Token);
             _errorPump = DrainErrorsAsync(process, _playback.Token);
@@ -56,6 +68,8 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
                 throw new InvalidOperationException(
                     $"GStreamer exited before receiving video (exit code {process.ExitCode}). Check installed plugins.");
             }
+            await WaitForUdpReceiverAsync(linuxSource.StreamUri.Port, process, cancellationToken)
+                .ConfigureAwait(false);
         }
         finally
         {
@@ -91,19 +105,48 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
             "-q",
             "udpsrc", $"port={source.StreamUri.Port}",
             "caps=application/x-rtp,media=video,clock-rate=90000,encoding-name=MP2T,payload=33",
-            "!", "rtpjitterbuffer", "latency=100", "drop-on-latency=true",
+            "!", "rtpjitterbuffer", "latency=100", "drop-on-latency=true", "do-lost=true",
             "!", "rtpmp2tdepay",
             "!", "tsdemux", "name=demux",
-            "demux.", "!", "queue", "!", "h264parse", "!", "decodebin",
+            "demux.", "!", "queue", "max-size-buffers=3", "max-size-bytes=0", "max-size-time=0", "leaky=downstream",
+            "!", "h264parse", "!", "decodebin",
             "!", "videoconvert", "!", "videoscale",
             "!", $"video/x-raw,format=BGRA,width={source.Width},height={source.Height}",
-            "!", "fdsink", "fd=1", "sync=false",
-            "demux.", "!", "queue", "!", "decodebin", "!", "audioconvert", "!", "audioresample",
-            "!", "autoaudiosink", "sync=false",
+            "!", "fdsink", "fd=1", "sync=true",
+            "demux.", "!", "queue", "max-size-buffers=12", "max-size-bytes=0", "max-size-time=0", "leaky=downstream",
+            "!", "decodebin", "!", "audioconvert", "!", "audioresample",
+            "!", "autoaudiosink", "sync=true",
         ];
         foreach (var argument in arguments)
             info.ArgumentList.Add(argument);
         return info;
+    }
+
+    private static async Task WaitForUdpReceiverAsync(
+        int port,
+        Process process,
+        CancellationToken cancellationToken)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(3);
+        while (DateTime.UtcNow < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (process.HasExited)
+                throw new InvalidOperationException($"GStreamer exited while binding UDP {port}.");
+
+            try
+            {
+                using var probe = new UdpClient(AddressFamily.InterNetwork);
+                probe.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, false);
+                probe.Client.Bind(new IPEndPoint(IPAddress.Any, port));
+            }
+            catch (SocketException exception) when (exception.SocketErrorCode == SocketError.AddressAlreadyInUse)
+            {
+                return;
+            }
+            await Task.Delay(50, cancellationToken).ConfigureAwait(false);
+        }
+        throw new TimeoutException($"GStreamer did not bind UDP {port} within 3 seconds.");
     }
 
     private async Task PumpFramesAsync(Process process, VideoSource source, CancellationToken cancellationToken)
@@ -126,6 +169,10 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
                             return;
                         offset += count;
                     }
+
+                    Interlocked.Exchange(
+                        ref _lastFrameUnixTimeMilliseconds,
+                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
 
                     if (Interlocked.CompareExchange(ref _framePending, 1, 0) != 0)
                         continue;
@@ -211,6 +258,7 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
         _playback = null;
         _framePump = null;
         _errorPump = null;
+        Interlocked.Exchange(ref _lastFrameUnixTimeMilliseconds, 0);
     }
 
     public async ValueTask DisposeAsync()

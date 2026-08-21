@@ -14,4 +14,8 @@
     <PackageReference Include="Tmds.DBus" Version="0.94.2" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="Miracast.Receiver.Linux.Tests" />
+  </ItemGroup>
+
 </Project>
