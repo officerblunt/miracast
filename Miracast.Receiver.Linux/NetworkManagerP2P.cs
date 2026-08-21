@@ -401,7 +401,7 @@ internal sealed record P2PConnectionContext(
     int WfdControlPort);
 
 [DBusInterface("org.freedesktop.NetworkManager")]
-internal interface INetworkManager : IDBusObject
+public interface INetworkManager : IDBusObject
 {
     Task<ObjectPath[]> GetDevicesAsync();
     Task<(ObjectPath connection, ObjectPath activeConnection, IDictionary<string, object> result)>
@@ -414,14 +414,14 @@ internal interface INetworkManager : IDBusObject
 }
 
 [DBusInterface("org.freedesktop.NetworkManager.Device")]
-internal interface INetworkManagerDevice : IDBusObject
+public interface INetworkManagerDevice : IDBusObject
 {
     Task<T> GetAsync<T>(string property);
     Task<IDisposable> WatchStateChangedAsync(Action<(uint newState, uint oldState, uint reason)> handler);
 }
 
 [DBusInterface("org.freedesktop.NetworkManager.Device.WifiP2P")]
-internal interface IWifiP2PDevice : IDBusObject
+public interface IWifiP2PDevice : IDBusObject
 {
     Task StartFindAsync(IDictionary<string, object> options);
     Task StopFindAsync();
@@ -431,13 +431,13 @@ internal interface IWifiP2PDevice : IDBusObject
 }
 
 [DBusInterface("org.freedesktop.NetworkManager.WifiP2PPeer")]
-internal interface IWifiP2PPeer : IDBusObject
+public interface IWifiP2PPeer : IDBusObject
 {
     Task<IDictionary<string, object>> GetAllAsync();
 }
 
 [DBusInterface("org.freedesktop.NetworkManager.IP4Config")]
-internal interface INetworkManagerIP4Config : IDBusObject
+public interface INetworkManagerIP4Config : IDBusObject
 {
     Task<IDictionary<string, object>> GetAllAsync();
 }
