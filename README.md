@@ -43,6 +43,8 @@ The host must provide:
 
 The .NET side uses `Tmds.DBus` and talks directly to `org.freedesktop.NetworkManager` on the system bus. It does not invoke `nmcli`, `systemctl`, MiracleCast, LibVLC, `sudo`, `su`, `pkexec`, or a shell.
 
+Do not follow MiracleCast setup instructions for this backend: keep both NetworkManager and its `wpa_supplicant` integration running, and do not start `miracle-wifid`. MiracleCast's daemon is an alternative Wi-Fi Direct controller and conflicts with the NetworkManager-based design used here.
+
 At startup it selects the first NetworkManager device whose `DeviceType` is `30` (`wifi-p2p`), subscribes to peer changes, starts discovery, and filters peers by a non-empty `WfdIEs` property. It activates the first WFD-capable peer using a volatile `wifi-p2p` connection with WPS Push Button. NetworkManager may show the desktop's normal Polkit authorization dialog for this operation.
 
 The built-in RTSP service listens on TCP port `7236`. The RTP MPEG-TS stream is received on UDP port `7236`, decoded by GStreamer, scaled to the renderer's BGRA frame size, and copied to the Avalonia `WriteableBitmap`. The current WFD implementation covers the basic unprotected UDP transport; HDCP, UIBC, TCP interleaving, PIN WPS, dynamic format changes and vendor-specific protocol extensions are not implemented.

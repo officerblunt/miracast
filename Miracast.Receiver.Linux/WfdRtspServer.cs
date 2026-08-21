@@ -44,6 +44,13 @@ internal sealed class WfdRtspServer : IAsyncDisposable
                 // StopAsync closes the listener explicitly, which wakes this accept
                 // without using the cancellation exception path.
                 var client = await _listener.AcceptTcpClientAsync().ConfigureAwait(false);
+                if (!_started || cancellationToken.IsCancellationRequested)
+                {
+                    // StopAsync wakes a pending accept with a regular loopback
+                    // connection. Do not create an RTSP session for that sentinel.
+                    client.Dispose();
+                    break;
+                }
                 _client?.Dispose();
                 _client = client;
                 try
@@ -51,6 +58,12 @@ internal sealed class WfdRtspServer : IAsyncDisposable
                     await RunSessionAsync(client, cancellationToken).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
+                {
+                }
+                catch (IOException) when (!_started || cancellationToken.IsCancellationRequested)
+                {
+                }
+                catch (SocketException) when (!_started || cancellationToken.IsCancellationRequested)
                 {
                 }
                 catch (Exception exception)
@@ -274,13 +287,28 @@ internal sealed class WfdRtspServer : IAsyncDisposable
             return;
         _started = false;
         _lifetime?.Cancel();
-        _listener.Stop();
         _client?.Dispose();
+
+        // Closing a listening socket while accept() is pending produces Linux
+        // errno 125 (ECANCELED), which debuggers can show even when caught. Wake
+        // accept normally instead, so shutdown has no exception path at all.
+        try
+        {
+            using var wakeup = new TcpClient(AddressFamily.InterNetwork);
+            await wakeup.ConnectAsync(IPAddress.Loopback, ControlPort).ConfigureAwait(false);
+        }
+        catch (SocketException)
+        {
+            // The accept loop may already have ended or the listener may have
+            // failed independently. Its task below owns the original outcome.
+        }
+
         if (_acceptLoop is not null)
         {
             try { await _acceptLoop.ConfigureAwait(false); }
             catch (OperationCanceledException) { }
         }
+        _listener.Stop();
         _acceptLoop = null;
         _client = null;
         _lifetime?.Dispose();
