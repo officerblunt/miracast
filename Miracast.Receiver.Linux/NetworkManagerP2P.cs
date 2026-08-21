@@ -405,8 +405,13 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                 await ConfigureWfdAdvertisementAsync(cancellationToken).ConfigureAwait(false);
                 var p2pDevice = _supplicantP2PDevice
                     ?? throw new InvalidOperationException("The wpa_supplicant P2PDevice proxy is not available.");
-                await p2pDevice.ListenAsync(600).WaitAsync(cancellationToken).ConfigureAwait(false);
-                // Re-apply and verify the Sink identity used by Probe Responses in Listen state.
+                await p2pDevice.FindAsync(new Dictionary<string, object>
+                {
+                    ["Timeout"] = 600,
+                    ["DiscoveryType"] = "start_with_full",
+                }).WaitAsync(cancellationToken).ConfigureAwait(false);
+                // Find alternates Search and Listen states. Re-apply and verify the
+                // Sink identity used by Probe Responses during its Listen periods.
                 await ConfigureWfdAdvertisementAsync(cancellationToken).ConfigureAwait(false);
                 await VerifyWfdAdvertisementAsync(cancellationToken).ConfigureAwait(false);
                 _finding = true;
@@ -592,7 +597,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         }
 
         Report(
-            $"Miracast receiver '{receiverName}' is advertising in P2P Listen mode "
+            $"Miracast receiver '{receiverName}' is searching and advertising in P2P mode "
             + "with WPS Push Button pairing. "
             + "Waiting for a Source to connect…");
     }
@@ -881,6 +886,7 @@ public interface IWpaSupplicant : IDBusObject
 [DBusInterface("fi.w1.wpa_supplicant1.Interface.P2PDevice")]
 public interface IWpaP2PDevice : IDBusObject
 {
+    Task FindAsync(IDictionary<string, object> options);
     Task ListenAsync(int timeout);
     Task StopFindAsync();
     Task<T> GetAsync<T>(string property);
