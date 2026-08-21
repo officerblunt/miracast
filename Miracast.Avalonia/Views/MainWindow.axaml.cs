@@ -37,6 +37,7 @@ public partial class MainWindow : Window
         _receiver.ConnectionCreated += OnConnectionCreated;
         _receiver.ConnectionClosed += OnConnectionClosed;
         _receiver.VideoReceived += OnVideoReceived;
+        _receiver.StatusChanged += OnStatusChanged;
         Opened += OnOpened;
         Closing += OnClosing;
     }
@@ -48,7 +49,7 @@ public partial class MainWindow : Window
         try
         {
             await _receiver.StartAsync(_lifetime.Token);
-            SetStatus("Ready — choose this PC in the source device's Cast menu.");
+            // The platform service reports its more specific ready/discovery state.
         }
         catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
         {
@@ -61,6 +62,9 @@ public partial class MainWindow : Window
 
     private void OnConnectionCreated(object? sender, ConnectionCreatedEventArgs args) =>
         SetStatus(args.DeviceName is null ? "Source connected." : $"Connected: {args.DeviceName}");
+
+    private void OnStatusChanged(object? sender, ReceiverStatusChangedEventArgs args) =>
+        SetStatus(args.Status);
 
     private async void OnConnectionClosed(object? sender, ConnectionClosedEventArgs args)
     {
@@ -155,6 +159,7 @@ public partial class MainWindow : Window
         _receiver.ConnectionCreated -= OnConnectionCreated;
         _receiver.ConnectionClosed -= OnConnectionClosed;
         _receiver.VideoReceived -= OnVideoReceived;
+        _receiver.StatusChanged -= OnStatusChanged;
         _bitmap?.Dispose();
         _lifetime.Dispose();
 

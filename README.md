@@ -3,7 +3,7 @@
 A minimal Avalonia UI with two independent platform applications:
 
 - Windows 10 1903 or newer: `Windows.Media.Miracast` receives the connection and the Windows media frame server copies video into an Avalonia `WriteableBitmap`.
-- Linux: MiracleCast performs Wi-Fi Direct and RTSP negotiation; LibVLC receives the MPEG-TS/RTP stream on UDP port `7236` and renders it inside the Avalonia window.
+- Linux: NetworkManager performs Wi-Fi Direct over its system D-Bus API, the application handles WFD/RTSP negotiation, and GStreamer receives the MPEG-TS/RTP stream and renders decoded frames inside the Avalonia window.
 
 The applications share only the platform-neutral UI and receiver contracts. Each platform solution contains one executable host and one receiver implementation, so Windows builds never reference LibVLC or MiracleCast and Linux builds never reference the Windows SDK or Direct3D backend.
 
@@ -35,31 +35,16 @@ dotnet run --project Miracast.Avalonia.Linux/Miracast.Avalonia.Linux.csproj
 
 ## Linux requirements
 
-The host must provide these executables/libraries:
+The host must provide:
 
-- `nmcli` (NetworkManager CLI);
-- `systemctl`;
-- `miracle-wifid` and `miracle-sinkctl` in `PATH`;
-- LibVLC (`libvlc`) with its plugins; decoded BGRA frames are copied into the same Avalonia `WriteableBitmap` path used on Windows.
+- NetworkManager 1.16 or newer with an adapter exposed as device type `wifi-p2p`;
+- `wpa_supplicant` and a Wi-Fi driver/firmware combination with Wi-Fi Direct support;
+- `gst-launch-1.0` plus GStreamer RTP, MPEG-TS, H.264, audio and video conversion plugins (normally the base/good/bad/libav plugin sets).
 
-MiracleCast's system D-Bus policy must be installed as part of the machine's normal MiracleCast setup. The desktop user must be allowed by the machine's polkit configuration to change NetworkManager state and stop/start `wpa_supplicant.service`.
+The .NET side uses `Tmds.DBus` and talks directly to `org.freedesktop.NetworkManager` on the system bus. It does not invoke `nmcli`, `systemctl`, MiracleCast, LibVLC, `sudo`, `su`, `pkexec`, or a shell.
 
-Some upstream MiracleCast builds also contain an explicit `getuid() != 0` check in `miracle-sinkctl`. Such a build cannot satisfy this application's non-root requirement and must be rebuilt/patched for an appropriately configured desktop user; the application never elevates it automatically.
+At startup it selects the first NetworkManager device whose `DeviceType` is `30` (`wifi-p2p`), subscribes to peer changes, starts discovery, and filters peers by a non-empty `WfdIEs` property. It activates the first WFD-capable peer using a volatile `wifi-p2p` connection with WPS Push Button. NetworkManager may show the desktop's normal Polkit authorization dialog for this operation.
 
-At runtime the application never invokes `sudo`, `su`, `pkexec`, or a shell. It refuses to start the Linux receiver when its effective user is root. Every command is started directly with the identity of the desktop user. Startup performs:
+The built-in RTSP service listens on TCP port `7236`. The RTP MPEG-TS stream is received on UDP port `7236`, decoded by GStreamer, scaled to the renderer's BGRA frame size, and copied to the Avalonia `WriteableBitmap`. The current WFD implementation covers the basic unprotected UDP transport; HDCP, UIBC, TCP interleaving, PIN WPS, dynamic format changes and vendor-specific protocol extensions are not implemented.
 
-```text
-nmcli device disconnect <wifi-interface>
-nmcli device set <wifi-interface> managed no
-systemctl stop wpa_supplicant.service
-miracle-wifid --interface <wifi-interface>
-miracle-sinkctl --external-player /bin/true --port 7236
-```
-
-The first interface reported as `wifi` by `nmcli` is selected. Set `MIRACAST_WIFI_INTERFACE` to choose a specific adapter. `miracle-sinkctl` link detection and its `run <link>` command are automatic.
-
-Startup waits for MiracleCast to expose its Wi-Fi link instead of imposing a fixed readiness timeout. If either MiracleCast process exits first, its exit code and recent stdout/stderr are included in the receiver error.
-
-When the window closes, child processes are stopped and the application makes a best-effort attempt to start `wpa_supplicant`, return the adapter to NetworkManager, and reconnect it.
-
-Because the selected Wi-Fi adapter is temporarily removed from NetworkManager, use a second adapter or Ethernet if the machine must keep network access while receiving.
+When the window closes, the application calls `DeactivateConnection()` and `StopFind()`, closes the RTSP listener, and stops the GStreamer process. Wi-Fi Direct/Miracast support remains highly dependent on the concrete adapter, kernel driver and firmware, so it must be validated on the target Linux hardware.

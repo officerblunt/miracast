@@ -1,6 +1,5 @@
 using System.Buffers;
-using System.Runtime.InteropServices;
-using LibVLCSharp.Shared;
+using System.Diagnostics;
 using Miracast.Receiver.Entities.EventArgs;
 
 namespace Miracast.Receiver.Linux;
@@ -8,14 +7,10 @@ namespace Miracast.Receiver.Linux;
 public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
 {
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
-    private LibVLC? _libVlc;
-    private MediaPlayer? _player;
-    private Media? _media;
-    private IntPtr _videoAllocation;
-    private IntPtr _videoBuffer;
-    private int _width;
-    private int _height;
-    private int _rowBytes;
+    private Process? _gstreamer;
+    private CancellationTokenSource? _playback;
+    private Task? _framePump;
+    private Task? _errorPump;
     private int _framePending;
     private bool _disposed;
 
@@ -24,43 +19,43 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
     public async Task PlayAsync(IVideoSource source, CancellationToken cancellationToken = default)
     {
         if (!OperatingSystem.IsLinux())
-            throw new PlatformNotSupportedException("The MiracleCast video renderer can only run on Linux.");
+            throw new PlatformNotSupportedException("The GStreamer renderer can only run on Linux.");
         if (source is not VideoSource linuxSource)
-            throw new ArgumentException("The source is not a MiracleCast RTP source.", nameof(source));
+            throw new ArgumentException("The source is not a Linux RTP source.", nameof(source));
         ObjectDisposedException.ThrowIf(_disposed, this);
 
         await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            await StopCoreAsync().ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
-            StopCore();
 
-            Core.Initialize();
-            _libVlc ??= new LibVLC("--network-caching=100", "--clock-jitter=0", "--clock-synchro=0");
-            _width = linuxSource.Width;
-            _height = linuxSource.Height;
-            _rowBytes = checked(_width * 4);
-            var bufferSize = checked(_rowBytes * _height);
-            _videoAllocation = Marshal.AllocHGlobal(checked(bufferSize + 31));
-            _videoBuffer = (IntPtr)((_videoAllocation.ToInt64() + 31) & ~31L);
-
-            var player = new MediaPlayer(_libVlc);
-            player.SetVideoFormat("RV32", (uint)_width, (uint)_height, (uint)_rowBytes);
-            player.SetVideoCallbacks(LockVideo, UnlockVideo, DisplayVideo);
-
-            var media = new Media(_libVlc, linuxSource.StreamUri);
-            media.AddOption(":network-caching=100");
-            media.AddOption(":live-caching=100");
-            if (!player.Play(media))
+            var process = new Process { StartInfo = CreateGStreamerStartInfo(linuxSource) };
+            try
             {
-                media.Dispose();
-                player.Dispose();
-                FreeBuffer();
-                throw new InvalidOperationException("LibVLC rejected the MiracleCast RTP stream.");
+                if (!process.Start())
+                    throw new InvalidOperationException("Could not start gst-launch-1.0.");
+            }
+            catch (System.ComponentModel.Win32Exception exception)
+            {
+                process.Dispose();
+                throw new InvalidOperationException(
+                    "Could not start gst-launch-1.0. Install GStreamer 1.x and the base/good/bad/libav plugins.",
+                    exception);
             }
 
-            _player = player;
-            _media = media;
+            _gstreamer = process;
+            _playback = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            _framePump = PumpFramesAsync(process, linuxSource, _playback.Token);
+            _errorPump = DrainErrorsAsync(process, _playback.Token);
+
+            await Task.Delay(150, cancellationToken).ConfigureAwait(false);
+            if (process.HasExited)
+            {
+                await Task.WhenAll(_framePump, _errorPump).ConfigureAwait(false);
+                throw new InvalidOperationException(
+                    $"GStreamer exited before receiving video (exit code {process.ExitCode}). Check installed plugins.");
+            }
         }
         finally
         {
@@ -73,7 +68,7 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
         await _lifecycle.WaitAsync().ConfigureAwait(false);
         try
         {
-            StopCore();
+            await StopCoreAsync().ConfigureAwait(false);
         }
         finally
         {
@@ -81,101 +76,149 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
         }
     }
 
-    private IntPtr LockVideo(IntPtr opaque, IntPtr planes)
+    private static ProcessStartInfo CreateGStreamerStartInfo(VideoSource source)
     {
-        Marshal.WriteIntPtr(planes, _videoBuffer);
-        return _videoBuffer;
+        var info = new ProcessStartInfo("gst-launch-1.0")
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+        };
+
+        string[] arguments =
+        [
+            "-q",
+            "udpsrc", $"port={source.StreamUri.Port}",
+            "caps=application/x-rtp,media=video,clock-rate=90000,encoding-name=MP2T,payload=33",
+            "!", "rtpjitterbuffer", "latency=100", "drop-on-latency=true",
+            "!", "rtpmp2tdepay",
+            "!", "tsdemux", "name=demux",
+            "demux.", "!", "queue", "!", "h264parse", "!", "decodebin",
+            "!", "videoconvert", "!", "videoscale",
+            "!", $"video/x-raw,format=BGRA,width={source.Width},height={source.Height}",
+            "!", "fdsink", "fd=1", "sync=false",
+            "demux.", "!", "queue", "!", "decodebin", "!", "audioconvert", "!", "audioresample",
+            "!", "autoaudiosink", "sync=false",
+        ];
+        foreach (var argument in arguments)
+            info.ArgumentList.Add(argument);
+        return info;
     }
 
-    private static void UnlockVideo(IntPtr opaque, IntPtr picture, IntPtr planes)
+    private async Task PumpFramesAsync(Process process, VideoSource source, CancellationToken cancellationToken)
     {
-    }
-
-    private void DisplayVideo(IntPtr opaque, IntPtr picture)
-    {
-        if (Interlocked.CompareExchange(ref _framePending, 1, 0) != 0)
-            return;
-
-        byte[]? pixels = null;
-        var ownershipTransferred = false;
+        var frameLength = checked(source.Width * source.Height * 4);
+        var stream = process.StandardOutput.BaseStream;
         try
         {
-            var length = checked(_rowBytes * _height);
-            pixels = ArrayPool<byte>.Shared.Rent(length);
-            Marshal.Copy(_videoBuffer, pixels, 0, length);
-
-            var rentedPixels = pixels;
-            var frame = new VideoFrameReceivedEventArgs(
-                rentedPixels,
-                _width,
-                _height,
-                _rowBytes,
-                () =>
-                {
-                    ArrayPool<byte>.Shared.Return(rentedPixels);
-                    Interlocked.Exchange(ref _framePending, 0);
-                });
-            pixels = null;
-            ownershipTransferred = true;
-
-            if (FrameReceived is null)
-                frame.Dispose();
-            else
+            while (!cancellationToken.IsCancellationRequested)
             {
+                byte[]? pixels = ArrayPool<byte>.Shared.Rent(frameLength);
                 try
                 {
-                    FrameReceived.Invoke(this, frame);
+                    var offset = 0;
+                    while (offset < frameLength)
+                    {
+                        var count = await stream.ReadAsync(
+                            pixels.AsMemory(offset, frameLength - offset), cancellationToken).ConfigureAwait(false);
+                        if (count == 0)
+                            return;
+                        offset += count;
+                    }
+
+                    if (Interlocked.CompareExchange(ref _framePending, 1, 0) != 0)
+                        continue;
+
+                    var ownedPixels = pixels;
+                    var frame = new VideoFrameReceivedEventArgs(
+                        ownedPixels,
+                        source.Width,
+                        source.Height,
+                        source.Width * 4,
+                        () =>
+                        {
+                            ArrayPool<byte>.Shared.Return(ownedPixels);
+                            Interlocked.Exchange(ref _framePending, 0);
+                        });
+                    pixels = null;
+
+                    if (FrameReceived is null)
+                        frame.Dispose();
+                    else
+                    {
+                        try { FrameReceived.Invoke(this, frame); }
+                        catch { frame.Dispose(); }
+                    }
                 }
-                catch
+                finally
                 {
-                    frame.Dispose();
+                    if (pixels is not null)
+                        ArrayPool<byte>.Shared.Return(pixels);
                 }
             }
         }
-        catch
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            if (pixels is not null)
-                ArrayPool<byte>.Shared.Return(pixels);
         }
-        finally
+        catch (ObjectDisposedException) when (cancellationToken.IsCancellationRequested)
         {
-            if (!ownershipTransferred)
-                Interlocked.Exchange(ref _framePending, 0);
         }
     }
 
-    private void StopCore()
+    private static async Task DrainErrorsAsync(Process process, CancellationToken cancellationToken)
     {
-        _player?.Stop();
-        _media?.Dispose();
-        _media = null;
-        _player?.Dispose();
-        _player = null;
-        FreeBuffer();
-        _width = 0;
-        _height = 0;
-        _rowBytes = 0;
+        try
+        {
+            while (await process.StandardError.ReadLineAsync(cancellationToken).ConfigureAwait(false) is not null)
+            {
+                // Draining stderr prevents a full pipe from stalling gst-launch.
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
     }
 
-    private void FreeBuffer()
+    private async Task StopCoreAsync()
     {
-        if (_videoAllocation == IntPtr.Zero)
-            return;
+        _playback?.Cancel();
+        if (_gstreamer is not null)
+        {
+            try
+            {
+                if (!_gstreamer.HasExited)
+                    _gstreamer.Kill(entireProcessTree: true);
+                await _gstreamer.WaitForExitAsync().ConfigureAwait(false);
+            }
+            catch (InvalidOperationException)
+            {
+            }
+        }
 
-        Marshal.FreeHGlobal(_videoAllocation);
-        _videoAllocation = IntPtr.Zero;
-        _videoBuffer = IntPtr.Zero;
+        try
+        {
+            await Task.WhenAll(_framePump ?? Task.CompletedTask, _errorPump ?? Task.CompletedTask)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+
+        _gstreamer?.Dispose();
+        _gstreamer = null;
+        _playback?.Dispose();
+        _playback = null;
+        _framePump = null;
+        _errorPump = null;
     }
 
     public async ValueTask DisposeAsync()
     {
         if (_disposed)
             return;
-
         _disposed = true;
         await StopAsync().ConfigureAwait(false);
-        _libVlc?.Dispose();
-        _libVlc = null;
         _lifecycle.Dispose();
     }
 }

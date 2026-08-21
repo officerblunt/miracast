@@ -10,4 +10,5 @@ public interface IMiracastReceiverService
     event EventHandler<ConnectionCreatedEventArgs>? ConnectionCreated;
     event EventHandler<ConnectionClosedEventArgs>? ConnectionClosed;
     event EventHandler<VideoReceivedEventArgs>? VideoReceived;
+    event EventHandler<ReceiverStatusChangedEventArgs>? StatusChanged;
 }

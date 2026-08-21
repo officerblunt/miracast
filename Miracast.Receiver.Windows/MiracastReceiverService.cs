@@ -14,6 +14,7 @@ public sealed class MiracastReceiverService : IMiracastReceiverService, IAsyncDi
     public event EventHandler<ConnectionCreatedEventArgs>? ConnectionCreated;
     public event EventHandler<ConnectionClosedEventArgs>? ConnectionClosed;
     public event EventHandler<VideoReceivedEventArgs>? VideoReceived;
+    public event EventHandler<ReceiverStatusChangedEventArgs>? StatusChanged;
 
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
@@ -53,6 +54,10 @@ public sealed class MiracastReceiverService : IMiracastReceiverService, IAsyncDi
 
             _receiver = receiver;
             _session = session;
+            StatusChanged?.Invoke(this, new ReceiverStatusChangedEventArgs
+            {
+                Status = "Ready — choose this PC in the source device's Cast menu.",
+            });
         }
         finally
         {
