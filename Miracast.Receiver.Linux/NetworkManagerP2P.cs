@@ -6,6 +6,8 @@ namespace Miracast.Receiver.Linux;
 internal sealed class NetworkManagerP2P : IAsyncDisposable
 {
     private const string Service = "org.freedesktop.NetworkManager";
+    private const string SupplicantService = "fi.w1.wpa_supplicant1";
+    private const string SupplicantPath = "/fi/w1/wpa_supplicant1";
     private const uint WifiP2PDeviceType = 30;
     private const uint DeviceStateActivated = 100;
     private const uint DeviceStateFailed = 120;
@@ -17,6 +19,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private readonly SemaphoreSlim _connectGate = new(1, 1);
     private readonly List<IDisposable> _subscriptions = [];
     private INetworkManager? _networkManager;
+    private IWpaSupplicant? _supplicant;
     private IWifiP2PDevice? _p2pDevice;
     private ObjectPath _devicePath;
     private ObjectPath? _activeConnection;
@@ -24,6 +27,8 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private Task? _findRenewal;
     private bool _finding;
     private bool _shouldFind;
+    private bool _wfdAdvertisementConfigured;
+    private byte[]? _previousWfdInformationElements;
     private bool _disposed;
 
     public event EventHandler<P2PConnectionContext>? PeerConnected;
@@ -37,6 +42,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
 
         await _bus.ConnectAsync().WaitAsync(cancellationToken).ConfigureAwait(false);
         _networkManager = _bus.CreateProxy<INetworkManager>(Service, "/org/freedesktop/NetworkManager");
+        _supplicant = _bus.CreateProxy<IWpaSupplicant>(SupplicantService, SupplicantPath);
 
         var devices = await _networkManager.GetDevicesAsync().WaitAsync(cancellationToken).ConfigureAwait(false);
         foreach (var path in devices)
@@ -211,6 +217,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         }
         _lifetime?.Dispose();
         _lifetime = null;
+        await RestoreWfdAdvertisementAsync().ConfigureAwait(false);
     }
 
     public async Task DisconnectCurrentAsync()
@@ -320,15 +327,16 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         {
             try
             {
+                await ConfigureWfdAdvertisementAsync(cancellationToken).ConfigureAwait(false);
                 await _p2pDevice.StartFindAsync(new Dictionary<string, object>
                 {
                     ["timeout"] = 600,
                 }).WaitAsync(cancellationToken).ConfigureAwait(false);
                 _finding = true;
-                Report("Searching for Miracast / Wi-Fi Display devices…");
+                Report("Miracast receiver is discoverable. Waiting for a Source to connect…");
                 return;
             }
-            catch (DBusException exception) when (exception.ErrorName == DeviceNotActiveError)
+            catch (DBusException exception) when (IsSupplicantTemporarilyUnavailable(exception))
             {
                 _finding = false;
                 if (!waitingReported)
@@ -342,6 +350,71 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             }
         }
     }
+
+    private async Task ConfigureWfdAdvertisementAsync(CancellationToken cancellationToken)
+    {
+        var supplicant = _supplicant
+            ?? throw new InvalidOperationException("The wpa_supplicant D-Bus proxy is not available.");
+        try
+        {
+            if (!_wfdAdvertisementConfigured)
+            {
+                _previousWfdInformationElements = await supplicant.GetAsync<byte[]>("WFDIEs")
+                    .WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            await supplicant.SetAsync("WFDIEs", SinkWfdInformationElements)
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
+            _wfdAdvertisementConfigured = true;
+        }
+        catch (DBusException exception) when (IsAccessDenied(exception))
+        {
+            throw new InvalidOperationException(
+                "The system D-Bus policy denied access to wpa_supplicant.WFDIEs. "
+                + "The receiver needs permission to publish its Miracast Sink capabilities.",
+                exception);
+        }
+        catch (DBusException exception) when (IsUnsupportedProperty(exception))
+        {
+            throw new InvalidOperationException(
+                "This wpa_supplicant build does not expose WFDIEs. "
+                + "Install a build with CONFIG_WIFI_DISPLAY and P2P support.",
+                exception);
+        }
+    }
+
+    private async Task RestoreWfdAdvertisementAsync()
+    {
+        if (!_wfdAdvertisementConfigured || _supplicant is null)
+            return;
+
+        try
+        {
+            await _supplicant.SetAsync("WFDIEs", _previousWfdInformationElements ?? []).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            Report($"Could not restore the previous WFD advertisement: {exception.Message}");
+        }
+        finally
+        {
+            _wfdAdvertisementConfigured = false;
+            _previousWfdInformationElements = null;
+        }
+    }
+
+    private static bool IsSupplicantTemporarilyUnavailable(DBusException exception) =>
+        exception.ErrorName is DeviceNotActiveError
+            or "org.freedesktop.DBus.Error.ServiceUnknown"
+            or "org.freedesktop.DBus.Error.NameHasNoOwner";
+
+    private static bool IsAccessDenied(DBusException exception) =>
+        exception.ErrorName is "org.freedesktop.DBus.Error.AccessDenied"
+            or "org.freedesktop.DBus.Error.AuthFailed";
+
+    private static bool IsUnsupportedProperty(DBusException exception) =>
+        exception.ErrorName is "org.freedesktop.DBus.Error.UnknownProperty"
+            or "org.freedesktop.DBus.Error.InvalidArgs";
 
     private async Task RenewDiscoveryAsync(CancellationToken cancellationToken)
     {
@@ -457,4 +530,11 @@ public interface IWifiP2PPeer : IDBusObject
 public interface INetworkManagerIP4Config : IDBusObject
 {
     Task<IDictionary<string, object>> GetAllAsync();
+}
+
+[DBusInterface("fi.w1.wpa_supplicant1")]
+public interface IWpaSupplicant : IDBusObject
+{
+    Task<T> GetAsync<T>(string property);
+    Task SetAsync(string property, object value);
 }

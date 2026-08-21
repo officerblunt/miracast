@@ -41,11 +41,11 @@ The host must provide:
 - `wpa_supplicant` and a Wi-Fi driver/firmware combination with Wi-Fi Direct support;
 - `gst-launch-1.0` plus GStreamer RTP, MPEG-TS, H.264, audio and video conversion plugins (normally the base/good/bad/libav plugin sets).
 
-The .NET side uses `Tmds.DBus` and talks directly to `org.freedesktop.NetworkManager` on the system bus. It does not invoke `nmcli`, `systemctl`, MiracleCast, LibVLC, `sudo`, `su`, `pkexec`, or a shell.
+The .NET side uses `Tmds.DBus` and talks to `org.freedesktop.NetworkManager` plus the global `fi.w1.wpa_supplicant1.WFDIEs` property on the system bus. It does not invoke `nmcli`, `systemctl`, MiracleCast, LibVLC, `sudo`, `su`, `pkexec`, or a shell. The desktop user must be permitted by the distribution's D-Bus policy to access `fi.w1.wpa_supplicant1` (Debian-family systems normally grant this to the `netdev` group).
 
 Do not follow MiracleCast setup instructions for this backend: keep both NetworkManager and its `wpa_supplicant` integration running, and do not start `miracle-wifid`. MiracleCast's daemon is an alternative Wi-Fi Direct controller and conflicts with the NetworkManager-based design used here.
 
-At startup it selects the first NetworkManager device whose `DeviceType` is `30` (`wifi-p2p`), subscribes to peer changes, starts discovery, and filters peers by a non-empty `WfdIEs` property. It activates the first WFD-capable peer using a volatile `wifi-p2p` connection with WPS Push Button. NetworkManager may show the desktop's normal Polkit authorization dialog for this operation.
+At startup it selects the first NetworkManager device whose `DeviceType` is `30` (`wifi-p2p`), publishes the Primary Sink WFD subelements `000600111c4400c8` through wpa_supplicant, subscribes to peer changes, and starts P2P discovery/listen. Publishing the local WFD capability before discovery is what makes Windows and Android list the machine as a Miracast receiver. It filters remote peers by a non-empty `WfdIEs` property and activates the first WFD-capable Source using a volatile `wifi-p2p` connection with WPS Push Button. NetworkManager may show the desktop's normal Polkit authorization dialog for this operation. The previous global WFD subelements are restored when the application stops.
 
 After P2P activation the application reads the local address and Source address from NetworkManager's IPv4 configuration. The Linux Sink then connects as a bidirectional RTSP client to the Source's TCP port `7236`, completes WFD M1-M7, and maintains `CSeq` and `Session` state while continuing to service Source requests.
 
