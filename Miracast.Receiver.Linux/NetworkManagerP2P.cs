@@ -27,6 +27,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private INetworkManager? _networkManager;
     private IWpaSupplicant? _supplicant;
     private IWpaP2PDevice? _supplicantP2PDevice;
+    private IWpaWps? _supplicantWps;
     private IWifiP2PDevice? _p2pDevice;
     private ObjectPath _devicePath;
     private ObjectPath? _activeConnection;
@@ -39,8 +40,11 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private string? _previousP2PDeviceName;
     private byte[]? _previousPrimaryDeviceType;
     private uint? _previousGoIntent;
+    private string? _previousWpsConfigMethods;
     private bool _p2pDeviceConfigured;
+    private bool _wpsConfigured;
     private bool _incomingRequestSubscriptionsConfigured;
+    private bool _connecting;
     private bool _disposed;
 
     public event EventHandler<P2PConnectionContext>? PeerConnected;
@@ -120,7 +124,8 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             var address = NormalizeHardwareAddress(peer.HardwareAddress);
             _peersByAddress[address] = peer;
             _peerAddressesByPath[path.ToString()] = address;
-            Report($"Found {peer.Name} ({peer.HardwareAddress}), signal {peer.Strength}%.");
+            if (!_connecting)
+                Report($"Found {peer.Name} ({peer.HardwareAddress}), signal {peer.Strength}%.");
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -135,7 +140,8 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     {
         if (_peerAddressesByPath.TryRemove(path.ToString(), out var address))
             _peersByAddress.TryRemove(address, out _);
-        Report($"Wi-Fi P2P peer disappeared: {path}");
+        if (!_connecting)
+            Report($"Wi-Fi P2P peer disappeared: {path}");
     }
 
     private async Task ConnectAsync(WifiP2PPeer peer, CancellationToken cancellationToken)
@@ -143,12 +149,33 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         if (!await _connectGate.WaitAsync(0, cancellationToken).ConfigureAwait(false))
             return;
 
+        _connecting = true;
         try
         {
             if (_activeConnection is not null || _networkManager is null)
                 return;
 
-            Report($"Connecting to {peer.Name}; confirm WPS Push Button if prompted…");
+            await StopFindAsync(disable: true).ConfigureAwait(false);
+            Report($"{peer.Name} requested a connection. Confirming WPS Push Button automatically…");
+
+            var device = _bus.CreateProxy<INetworkManagerDevice>(Service, _devicePath);
+            var activated = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var stateSubscription = await device.WatchStateChangedAsync(change =>
+            {
+                if (change.newState == DeviceStateActivated)
+                    activated.TrySetResult();
+                else if (change.newState == DeviceStateFailed)
+                    activated.TrySetException(new InvalidOperationException(
+                        $"NetworkManager activation failed (reason {change.reason})."));
+                else if (change.newState == 60)
+                    Report("NetworkManager is waiting for WPS or a Polkit authorization…");
+                else if (change.newState == 70)
+                    Report("Wi-Fi Direct pairing succeeded. Configuring the P2P IP address…");
+                else if (_activeConnection is not null && change.newState <= 30)
+                    _ = HandleDisconnectedAsync(_lifetime?.Token ?? CancellationToken.None);
+            }).WaitAsync(cancellationToken).ConfigureAwait(false);
+            _subscriptions.Add(stateSubscription);
+
             var id = $"Miracast {peer.Name}";
             var connection = new Dictionary<string, IDictionary<string, object>>
             {
@@ -172,30 +199,28 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                 ["bind-activation"] = "dbus-name",
             };
 
-            var result = await _networkManager.AddAndActivateConnection2Async(
-                connection, _devicePath, peer.Path, options).WaitAsync(cancellationToken).ConfigureAwait(false);
-            _activeConnection = result.activeConnection;
-
-            var device = _bus.CreateProxy<INetworkManagerDevice>(Service, _devicePath);
-            var activated = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            var stateSubscription = await device.WatchStateChangedAsync(change =>
+            (ObjectPath connection, ObjectPath activeConnection, IDictionary<string, object> result) result;
+            try
             {
-                if (change.newState == DeviceStateActivated)
-                    activated.TrySetResult();
-                else if (change.newState == DeviceStateFailed)
-                    activated.TrySetException(new InvalidOperationException(
-                        $"NetworkManager activation failed (reason {change.reason})."));
-                else if (_activeConnection is not null && change.newState <= 30)
-                    _ = HandleDisconnectedAsync(_lifetime?.Token ?? CancellationToken.None);
-            }).WaitAsync(cancellationToken).ConfigureAwait(false);
-            _subscriptions.Add(stateSubscription);
+                result = await _networkManager.AddAndActivateConnection2Async(
+                    connection, _devicePath, peer.Path, options)
+                    .WaitAsync(TimeSpan.FromSeconds(30), cancellationToken).ConfigureAwait(false);
+            }
+            catch (TimeoutException exception)
+            {
+                throw new InvalidOperationException(
+                    "NetworkManager did not authorize the P2P activation within 30 seconds. "
+                    + "Make sure a desktop Polkit authentication agent is running.",
+                    exception);
+            }
+            _activeConnection = result.activeConnection;
+            Report("NetworkManager accepted the P2P activation. Completing WPS pairing…");
 
             var state = await device.GetAsync<uint>("State").WaitAsync(cancellationToken).ConfigureAwait(false);
             if (state == DeviceStateActivated)
                 activated.TrySetResult();
 
             await activated.Task.WaitAsync(TimeSpan.FromSeconds(90), cancellationToken).ConfigureAwait(false);
-            await StopFindAsync(disable: true).ConfigureAwait(false);
             var context = await CreateConnectionContextAsync(device, peer, cancellationToken).ConfigureAwait(false);
             PeerConnected?.Invoke(this, context);
         }
@@ -207,10 +232,16 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                 catch { }
                 _activeConnection = null;
             }
+            if (!cancellationToken.IsCancellationRequested)
+            {
+                try { await StartDiscoveryAsync(cancellationToken).ConfigureAwait(false); }
+                catch { }
+            }
             throw;
         }
         finally
         {
+            _connecting = false;
             _connectGate.Release();
         }
     }
@@ -426,6 +457,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                     var existing = await candidate.GetAsync<IDictionary<string, object>>("P2PDeviceConfig")
                         .WaitAsync(cancellationToken).ConfigureAwait(false);
                     _supplicantP2PDevice = candidate;
+                    _supplicantWps = _bus.CreateProxy<IWpaWps>(SupplicantService, path);
                     if (existing.TryGetValue("DeviceName", out var name) && name is string deviceName)
                         _previousP2PDeviceName = deviceName;
                     if (existing.TryGetValue("PrimaryDeviceType", out var type) && type is byte[] primaryType)
@@ -453,6 +485,18 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             ["GOIntent"] = 0u,
         }).WaitAsync(cancellationToken).ConfigureAwait(false);
         _p2pDeviceConfigured = true;
+
+        var wps = _supplicantWps
+            ?? throw new InvalidOperationException(
+                "wpa_supplicant did not expose a WPS interface for the Wi-Fi adapter.");
+        if (!_wpsConfigured)
+        {
+            _previousWpsConfigMethods = await wps.GetAsync<string>("ConfigMethods")
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        await wps.SetAsync("ConfigMethods", "push_button virtual_push_button")
+            .WaitAsync(cancellationToken).ConfigureAwait(false);
+        _wpsConfigured = true;
 
         if (!_incomingRequestSubscriptionsConfigured)
         {
@@ -518,8 +562,19 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             throw new InvalidOperationException("wpa_supplicant did not retain the Miracast Display device type.");
         }
 
+        var configMethods = await _supplicantWps!.GetAsync<string>("ConfigMethods")
+            .WaitAsync(cancellationToken).ConfigureAwait(false);
+        var wpsMethods = configMethods.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (!wpsMethods.Contains("push_button", StringComparer.Ordinal)
+            && !wpsMethods.Contains("virtual_push_button", StringComparer.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "wpa_supplicant did not retain the WPS Push Button pairing method.");
+        }
+
         Report(
-            $"Miracast receiver '{receiverName}' is advertising in P2P Listen mode. "
+            $"Miracast receiver '{receiverName}' is advertising in P2P Listen mode "
+            + "with WPS Push Button pairing. "
             + "Waiting for a Source to connect…");
     }
 
@@ -622,6 +677,11 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                 if (previousConfig.Count > 0)
                     await _supplicantP2PDevice.SetAsync("P2PDeviceConfig", previousConfig).ConfigureAwait(false);
             }
+            if (_wpsConfigured && _supplicantWps is not null && _previousWpsConfigMethods is not null)
+            {
+                await _supplicantWps.SetAsync("ConfigMethods", _previousWpsConfigMethods)
+                    .ConfigureAwait(false);
+            }
             if (_wfdAdvertisementConfigured && _supplicant is not null)
             {
                 await _supplicant.SetAsync("WFDIEs", _previousWfdInformationElements ?? [])
@@ -637,11 +697,14 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             _wfdAdvertisementConfigured = false;
             _previousWfdInformationElements = null;
             _p2pDeviceConfigured = false;
+            _wpsConfigured = false;
             _incomingRequestSubscriptionsConfigured = false;
             _supplicantP2PDevice = null;
+            _supplicantWps = null;
             _previousP2PDeviceName = null;
             _previousPrimaryDeviceType = null;
             _previousGoIntent = null;
+            _previousWpsConfigMethods = null;
         }
     }
 
@@ -830,6 +893,13 @@ public interface IWpaP2PDevice : IDBusObject
     Task<IDisposable> WatchGONegotiationFailureAsync(
         Action<IDictionary<string, object>> handler,
         Action<Exception>? onError = null);
+}
+
+[DBusInterface("fi.w1.wpa_supplicant1.Interface.WPS")]
+public interface IWpaWps : IDBusObject
+{
+    Task<T> GetAsync<T>(string property);
+    Task SetAsync(string property, object value);
 }
 
 [DBusInterface("fi.w1.wpa_supplicant1.Peer")]
