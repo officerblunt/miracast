@@ -38,7 +38,12 @@ internal sealed class WfdRtspServer : IAsyncDisposable
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                var client = await _listener.AcceptTcpClientAsync(cancellationToken).ConfigureAwait(false);
+                // Do not pass the cancellation token here. On Linux the socket
+                // implementation throws a first-chance OperationCanceledException
+                // from inside AcceptTcpClientAsync when the token is cancelled.
+                // StopAsync closes the listener explicitly, which wakes this accept
+                // without using the cancellation exception path.
+                var client = await _listener.AcceptTcpClientAsync().ConfigureAwait(false);
                 _client?.Dispose();
                 _client = client;
                 try
@@ -61,10 +66,7 @@ internal sealed class WfdRtspServer : IAsyncDisposable
                 }
             }
         }
-        // AcceptTcpClientAsync may surface cancellation before the linked token's
-        // IsCancellationRequested value is observable on this continuation.
-        // Cancellation is always a normal terminal condition for this loop because
-        // this is the only token passed to the accept operation.
+        // A session read/write still uses the cancellation token.
         catch (OperationCanceledException)
         {
         }
