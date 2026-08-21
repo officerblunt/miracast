@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.18362.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia.Skia" Version="11.3.9" />
+    <PackageReference Include="Avalonia.Win32" Version="11.3.9" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Miracast.Avalonia\Miracast.Avalonia.csproj" />
+    <ProjectReference Include="..\Miracast.Receiver.Windows\Miracast.Receiver.Windows.csproj" />
+  </ItemGroup>
+</Project>

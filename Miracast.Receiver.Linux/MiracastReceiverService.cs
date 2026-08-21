@@ -46,19 +46,56 @@ public sealed partial class MiracastReceiverService : IMiracastReceiverService, 
                 .ConfigureAwait(false);
 
             _outputCancellation = new CancellationTokenSource();
+            var wifidOutput = new List<string>();
+            var wifidOutputLock = new object();
             _wifid = StartProcess("miracle-wifid", ["--interface", _wifiInterface]);
-            _ = PumpOutputAsync(_wifid, HandleWifidLine, _outputCancellation.Token);
+            var wifidPump = PumpOutputAsync(_wifid, line =>
+            {
+                CaptureRecentOutput(wifidOutput, wifidOutputLock, line);
+                HandleWifidLine(line);
+            }, _outputCancellation.Token);
 
             await Task.Delay(500, cancellationToken).ConfigureAwait(false);
+            if (_wifid.HasExited)
+            {
+                await wifidPump.ConfigureAwait(false);
+                throw CreateProcessExitedException("miracle-wifid", _wifid, wifidOutput, wifidOutputLock);
+            }
 
+            var sinkOutput = new List<string>();
+            var sinkOutputLock = new object();
             _sinkctl = StartProcess("miracle-sinkctl",
                 ["--external-player", "/bin/true", "--port", RtpPort.ToString()]);
 
             var linkReady = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
-            _ = PumpOutputAsync(_sinkctl, line => HandleSinkLine(line, linkReady), _outputCancellation.Token);
+            var sinkPump = PumpOutputAsync(_sinkctl, line =>
+            {
+                CaptureRecentOutput(sinkOutput, sinkOutputLock, line);
+                HandleSinkLine(line, linkReady);
+            }, _outputCancellation.Token);
 
-            var link = await linkReady.Task.WaitAsync(TimeSpan.FromSeconds(15), cancellationToken)
-                .ConfigureAwait(false);
+            var wifidExit = _wifid.WaitForExitAsync(cancellationToken);
+            var sinkExit = _sinkctl.WaitForExitAsync(cancellationToken);
+            await Task.WhenAny(linkReady.Task, wifidExit, sinkExit).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (!linkReady.Task.IsCompletedSuccessfully)
+            {
+                if (_sinkctl.HasExited)
+                {
+                    await sinkPump.ConfigureAwait(false);
+                    throw CreateProcessExitedException("miracle-sinkctl", _sinkctl, sinkOutput, sinkOutputLock);
+                }
+                if (_wifid.HasExited)
+                {
+                    await wifidPump.ConfigureAwait(false);
+                    throw CreateProcessExitedException("miracle-wifid", _wifid, wifidOutput, wifidOutputLock);
+                }
+
+                throw new InvalidOperationException("MiracleCast stopped before exposing a Wi-Fi link.");
+            }
+
+            var link = await linkReady.Task.ConfigureAwait(false);
             await _sinkctl.StandardInput.WriteLineAsync($"run {link}").ConfigureAwait(false);
             await _sinkctl.StandardInput.FlushAsync(cancellationToken).ConfigureAwait(false);
             _started = true;
@@ -218,6 +255,32 @@ public sealed partial class MiracastReceiverService : IMiracastReceiverService, 
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
         }
+    }
+
+    private static void CaptureRecentOutput(List<string> output, object outputLock, string line)
+    {
+        lock (outputLock)
+        {
+            output.Add(line);
+            if (output.Count > 40)
+                output.RemoveAt(0);
+        }
+    }
+
+    private static InvalidOperationException CreateProcessExitedException(
+        string processName,
+        Process process,
+        List<string> output,
+        object outputLock)
+    {
+        string details;
+        lock (outputLock)
+            details = output.Count == 0 ? "No output was captured." : string.Join(Environment.NewLine, output);
+
+        return new InvalidOperationException(
+            $"{processName} exited before the receiver became ready (exit code {process.ExitCode})."
+            + Environment.NewLine
+            + details);
     }
 
     private void HandleWifidLine(string line) => LogReceived?.Invoke(this, line);

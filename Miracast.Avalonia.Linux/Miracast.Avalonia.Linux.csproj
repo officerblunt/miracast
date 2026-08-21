@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia.X11" Version="11.3.9" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Miracast.Avalonia\Miracast.Avalonia.csproj" />
+    <ProjectReference Include="..\Miracast.Receiver.Linux\Miracast.Receiver.Linux.csproj" />
+  </ItemGroup>
+</Project>

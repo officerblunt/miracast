@@ -1,6 +1,5 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
@@ -14,7 +13,6 @@
 
   <ItemGroup>
     <PackageReference Include="Avalonia" Version="11.3.9"/>
-    <PackageReference Include="Avalonia.Desktop" Version="11.3.9"/>
     <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.9"/>
     <PackageReference Include="Avalonia.Fonts.Inter" Version="11.3.9"/>
     <!--Condition below is needed to remove Avalonia.Diagnostics package from build output in Release configuration.-->
@@ -28,7 +26,5 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Miracast.Receiver\Miracast.Receiver.csproj" />
-    <ProjectReference Include="..\Miracast.Receiver.Windows\Miracast.Receiver.Windows.csproj" />
-    <ProjectReference Include="..\Miracast.Receiver.Linux\Miracast.Receiver.Linux.csproj" />
   </ItemGroup>
 </Project>

@@ -2,6 +2,7 @@ using Avalonia;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Data.Core;
 using Avalonia.Data.Core.Plugins;
+using System;
 using System.Linq;
 using Avalonia.Markup.Xaml;
 using Microsoft.Extensions.DependencyInjection;
@@ -12,7 +13,13 @@ namespace Miracast.Avalonia;
 
 public partial class App : Application
 {
+    private readonly Action<IServiceCollection> _configurePlatformServices;
     private ServiceProvider? _serviceProvider;
+
+    public App(Action<IServiceCollection> configurePlatformServices)
+    {
+        _configurePlatformServices = configurePlatformServices;
+    }
 
     public override void Initialize()
     {
@@ -28,7 +35,7 @@ public partial class App : Application
             DisableAvaloniaDataAnnotationValidation();
 
             var services = new ServiceCollection();
-            services.AddMiracastReceiver();
+            _configurePlatformServices(services);
             services.AddSingleton<MainWindowViewModel>();
             services.AddSingleton<MainWindow>();
             _serviceProvider = services.BuildServiceProvider(new ServiceProviderOptions
