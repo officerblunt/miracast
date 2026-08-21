@@ -27,7 +27,6 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private INetworkManager? _networkManager;
     private IWpaSupplicant? _supplicant;
     private IWpaP2PDevice? _supplicantP2PDevice;
-    private IWpaWps? _supplicantWps;
     private IWifiP2PDevice? _p2pDevice;
     private ObjectPath _devicePath;
     private ObjectPath? _activeConnection;
@@ -40,9 +39,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private string? _previousP2PDeviceName;
     private byte[]? _previousPrimaryDeviceType;
     private uint? _previousGoIntent;
-    private string? _previousWpsConfigMethods;
     private bool _p2pDeviceConfigured;
-    private bool _wpsConfigured;
     private bool _incomingRequestSubscriptionsConfigured;
     private bool _disposed;
 
@@ -429,7 +426,6 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                     var existing = await candidate.GetAsync<IDictionary<string, object>>("P2PDeviceConfig")
                         .WaitAsync(cancellationToken).ConfigureAwait(false);
                     _supplicantP2PDevice = candidate;
-                    _supplicantWps = _bus.CreateProxy<IWpaWps>(SupplicantService, path);
                     if (existing.TryGetValue("DeviceName", out var name) && name is string deviceName)
                         _previousP2PDeviceName = deviceName;
                     if (existing.TryGetValue("PrimaryDeviceType", out var type) && type is byte[] primaryType)
@@ -457,22 +453,6 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             ["GOIntent"] = 0u,
         }).WaitAsync(cancellationToken).ConfigureAwait(false);
         _p2pDeviceConfigured = true;
-
-        var wps = _supplicantWps
-            ?? throw new InvalidOperationException(
-                "wpa_supplicant did not expose a WPS interface for the Wi-Fi adapter.");
-        if (!_wpsConfigured)
-        {
-            _previousWpsConfigMethods = await wps.GetAsync<string>("ConfigMethods")
-                .WaitAsync(cancellationToken).ConfigureAwait(false);
-        }
-
-        // Windows normally pairs with a Miracast display without showing a PIN.
-        // Advertising PIN methods makes some Sources choose a flow that this
-        // unattended receiver cannot complete.
-        await wps.SetAsync("ConfigMethods", "push_button virtual_push_button")
-            .WaitAsync(cancellationToken).ConfigureAwait(false);
-        _wpsConfigured = true;
 
         if (!_incomingRequestSubscriptionsConfigured)
         {
@@ -538,19 +518,8 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             throw new InvalidOperationException("wpa_supplicant did not retain the Miracast Display device type.");
         }
 
-        var configMethods = await _supplicantWps!.GetAsync<string>("ConfigMethods")
-            .WaitAsync(cancellationToken).ConfigureAwait(false);
-        var wpsMethods = configMethods.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        if (!wpsMethods.Contains("push_button", StringComparer.Ordinal)
-            && !wpsMethods.Contains("virtual_push_button", StringComparer.Ordinal))
-        {
-            throw new InvalidOperationException(
-                "wpa_supplicant did not retain the WPS Push Button pairing method.");
-        }
-
         Report(
-            $"Miracast receiver '{receiverName}' is advertising in P2P Listen mode "
-            + "with WPS Push Button pairing. "
+            $"Miracast receiver '{receiverName}' is advertising in P2P Listen mode. "
             + "Waiting for a Source to connect…");
     }
 
@@ -653,11 +622,6 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                 if (previousConfig.Count > 0)
                     await _supplicantP2PDevice.SetAsync("P2PDeviceConfig", previousConfig).ConfigureAwait(false);
             }
-            if (_wpsConfigured && _supplicantWps is not null && _previousWpsConfigMethods is not null)
-            {
-                await _supplicantWps.SetAsync("ConfigMethods", _previousWpsConfigMethods)
-                    .ConfigureAwait(false);
-            }
             if (_wfdAdvertisementConfigured && _supplicant is not null)
             {
                 await _supplicant.SetAsync("WFDIEs", _previousWfdInformationElements ?? [])
@@ -673,14 +637,11 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             _wfdAdvertisementConfigured = false;
             _previousWfdInformationElements = null;
             _p2pDeviceConfigured = false;
-            _wpsConfigured = false;
             _incomingRequestSubscriptionsConfigured = false;
             _supplicantP2PDevice = null;
-            _supplicantWps = null;
             _previousP2PDeviceName = null;
             _previousPrimaryDeviceType = null;
             _previousGoIntent = null;
-            _previousWpsConfigMethods = null;
         }
     }
 
@@ -869,13 +830,6 @@ public interface IWpaP2PDevice : IDBusObject
     Task<IDisposable> WatchGONegotiationFailureAsync(
         Action<IDictionary<string, object>> handler,
         Action<Exception>? onError = null);
-}
-
-[DBusInterface("fi.w1.wpa_supplicant1.Interface.WPS")]
-public interface IWpaWps : IDBusObject
-{
-    Task<T> GetAsync<T>(string property);
-    Task SetAsync(string property, object value);
 }
 
 [DBusInterface("fi.w1.wpa_supplicant1.Peer")]
