@@ -4,7 +4,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using Avalonia;
 using Avalonia.Controls;
-using Avalonia.Interactivity;
 using Avalonia.Media.Imaging;
 using Avalonia.Platform;
 using Avalonia.Threading;
@@ -17,7 +16,6 @@ namespace Miracast.Avalonia.Views;
 public partial class MainWindow : Window
 {
     private readonly IMiracastReceiverService _receiver;
-    private readonly IMiracastConnectionApprover? _connectionApprover;
     private readonly IVideoRenderer _videoRenderer;
     private readonly CancellationTokenSource _lifetime = new();
     private WriteableBitmap? _bitmap;
@@ -30,7 +28,6 @@ public partial class MainWindow : Window
         MainWindowViewModel viewModel)
     {
         _receiver = receiver;
-        _connectionApprover = receiver as IMiracastConnectionApprover;
         _videoRenderer = videoRenderer;
 
         InitializeComponent();
@@ -41,8 +38,6 @@ public partial class MainWindow : Window
         _receiver.ConnectionClosed += OnConnectionClosed;
         _receiver.VideoReceived += OnVideoReceived;
         _receiver.StatusChanged += OnStatusChanged;
-        if (_connectionApprover is not null)
-            _connectionApprover.SourceChanged += OnSourceChanged;
         Opened += OnOpened;
         Closing += OnClosing;
     }
@@ -70,36 +65,6 @@ public partial class MainWindow : Window
 
     private void OnStatusChanged(object? sender, ReceiverStatusChangedEventArgs args) =>
         SetStatus(args.Status);
-
-    private void OnSourceChanged(object? sender, MiracastSourceChangedEventArgs args) =>
-        Dispatcher.UIThread.Post(() => ViewModel.UpdateSource(args.Source, args.IsAvailable));
-
-    private async void OnApproveConnectionClicked(object? sender, RoutedEventArgs args)
-    {
-        if (_connectionApprover is null
-            || sender is not Button { DataContext: MiracastSourceInfo source } button)
-        {
-            return;
-        }
-
-        button.IsEnabled = false;
-        SetStatus($"Approving connection from {source.Name}…");
-        try
-        {
-            await _connectionApprover.ApproveConnectionAsync(source.Id, _lifetime.Token);
-        }
-        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
-        {
-        }
-        catch (Exception exception)
-        {
-            SetStatus($"Could not approve {source.Name}: {exception.Message}");
-        }
-        finally
-        {
-            button.IsEnabled = true;
-        }
-    }
 
     private async void OnConnectionClosed(object? sender, ConnectionClosedEventArgs args)
     {
@@ -196,8 +161,6 @@ public partial class MainWindow : Window
         _receiver.ConnectionClosed -= OnConnectionClosed;
         _receiver.VideoReceived -= OnVideoReceived;
         _receiver.StatusChanged -= OnStatusChanged;
-        if (_connectionApprover is not null)
-            _connectionApprover.SourceChanged -= OnSourceChanged;
         _bitmap?.Dispose();
         _lifetime.Dispose();
 

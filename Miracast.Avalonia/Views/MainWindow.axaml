@@ -1,7 +1,6 @@
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:Miracast.Avalonia.ViewModels"
-        xmlns:receiver="using:Miracast.Receiver"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
@@ -21,47 +20,6 @@
 
     <Grid Background="Black">
         <Image x:Name="FrameImage" Stretch="Uniform" />
-
-        <Border IsVisible="{Binding HasAvailableSources}"
-                HorizontalAlignment="Right"
-                VerticalAlignment="Top"
-                Margin="16"
-                Padding="14"
-                CornerRadius="8"
-                Background="#D0202020"
-                MaxWidth="360">
-            <StackPanel Spacing="10">
-                <TextBlock Text="Confirm connection on this receiver"
-                           Foreground="White"
-                           FontSize="16"
-                           FontWeight="SemiBold" />
-                <TextBlock Text="Select the computer that is currently waiting to connect:"
-                           Foreground="#D0FFFFFF"
-                           TextWrapping="Wrap" />
-                <ItemsControl ItemsSource="{Binding AvailableSources}">
-                    <ItemsControl.ItemTemplate>
-                        <DataTemplate x:DataType="receiver:MiracastSourceInfo">
-                            <Button Click="OnApproveConnectionClicked"
-                                    HorizontalContentAlignment="Stretch"
-                                    Margin="0,3">
-                                <Grid ColumnDefinitions="*,Auto">
-                                    <StackPanel>
-                                        <TextBlock Text="{Binding Name}" FontWeight="SemiBold" />
-                                        <TextBlock Text="{Binding HardwareAddress}"
-                                                   FontSize="11"
-                                                   Opacity="0.7" />
-                                    </StackPanel>
-                                    <TextBlock Grid.Column="1"
-                                               Margin="12,0,0,0"
-                                               VerticalAlignment="Center"
-                                               Text="{Binding Strength, StringFormat={}{0}%}" />
-                                </Grid>
-                            </Button>
-                        </DataTemplate>
-                    </ItemsControl.ItemTemplate>
-                </ItemsControl>
-            </StackPanel>
-        </Border>
 
         <Border VerticalAlignment="Bottom"
                 Background="#B0000000"
