@@ -185,7 +185,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                     activated.TrySetResult();
                 else if (change.newState == DeviceStateFailed)
                     activated.TrySetException(new InvalidOperationException(
-                        $"NetworkManager activation failed (reason {change.reason})."));
+                        $"NetworkManager activation failed: {DescribeDeviceStateReason(change.reason)}."));
                 else if (change.newState == 60)
                     Report("NetworkManager is waiting for WPS or a Polkit authorization…");
                 else if (change.newState == 70)
@@ -234,6 +234,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             }
             _activeConnection = result.activeConnection;
             Report("NetworkManager accepted the P2P activation. Completing WPS pairing…");
+            await AuthorizePendingGoNegotiationAsync(peer, cancellationToken).ConfigureAwait(false);
 
             var state = await device.GetAsync<uint>("State").WaitAsync(cancellationToken).ConfigureAwait(false);
             if (state == DeviceStateActivated)
@@ -562,7 +563,67 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                 properties => Report($"Wi-Fi Direct GO negotiation failed: {FormatProperties(properties)}"),
                 exception => Report($"Could not monitor GO negotiation failures: {exception.Message}"))
                 .WaitAsync(cancellationToken).ConfigureAwait(false));
+            _subscriptions.Add(await p2pDevice.WatchGONegotiationSuccessAsync(
+                properties => Report($"Wi-Fi Direct GO negotiation succeeded: {FormatProperties(properties)}"),
+                exception => Report($"Could not monitor GO negotiation success: {exception.Message}"))
+                .WaitAsync(cancellationToken).ConfigureAwait(false));
+            _subscriptions.Add(await p2pDevice.WatchGroupFormationFailureAsync(
+                reason => Report($"Wi-Fi Direct group formation failed: {reason}"),
+                exception => Report($"Could not monitor group formation failures: {exception.Message}"))
+                .WaitAsync(cancellationToken).ConfigureAwait(false));
             _incomingRequestSubscriptionsConfigured = true;
+        }
+    }
+
+    private async Task AuthorizePendingGoNegotiationAsync(
+        WifiP2PPeer peer,
+        CancellationToken cancellationToken)
+    {
+        var p2pDevice = _supplicantP2PDevice
+            ?? throw new InvalidOperationException("The wpa_supplicant P2P interface is unavailable.");
+        var targetAddress = NormalizeHardwareAddress(peer.HardwareAddress);
+        var supplicantPeers = await p2pDevice.GetAsync<ObjectPath[]>("Peers")
+            .WaitAsync(cancellationToken).ConfigureAwait(false);
+
+        ObjectPath? targetPath = null;
+        foreach (var path in supplicantPeers)
+        {
+            var supplicantPeer = _bus.CreateProxy<IWpaPeer>(SupplicantService, path);
+            var addressBytes = await supplicantPeer.GetAsync<byte[]>("DeviceAddress")
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
+            if (Convert.ToHexString(addressBytes).Equals(targetAddress, StringComparison.OrdinalIgnoreCase))
+            {
+                targetPath = path;
+                break;
+            }
+        }
+
+        if (targetPath is null)
+        {
+            Report(
+                $"NetworkManager started WPS, but wpa_supplicant no longer exposes peer "
+                + $"{peer.HardwareAddress} for incoming authorization.");
+            return;
+        }
+
+        try
+        {
+            await p2pDevice.ConnectAsync(new Dictionary<string, object>
+            {
+                ["peer"] = targetPath.Value,
+                ["persistent"] = false,
+                ["authorize_only"] = true,
+                ["go_intent"] = 0,
+                ["wps_method"] = "pbc",
+            }).WaitAsync(cancellationToken).ConfigureAwait(false);
+            Report($"Authorized the incoming GO negotiation from {peer.Name}; waiting for WPS…");
+        }
+        catch (DBusException exception)
+        {
+            // NetworkManager may have already authorized the same request between
+            // AddAndActivateConnection2 returning and this call. Keep its activation
+            // alive, but retain the exact supplicant response in the UI.
+            Report($"Direct GO authorization returned {exception.ErrorName}: {exception.Message}");
         }
     }
 
@@ -737,6 +798,17 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             ? "no details"
             : string.Join(", ", properties.Select(pair => $"{pair.Key}={pair.Value}"));
 
+    private static string DescribeDeviceStateReason(uint reason) => reason switch
+    {
+        5 => "IPv4 configuration is unavailable (reason 5)",
+        7 => "required WPS credentials were not supplied (reason 7)",
+        8 => "wpa_supplicant disconnected (reason 8)",
+        9 => "wpa_supplicant rejected the configuration (reason 9)",
+        10 => "wpa_supplicant failed (reason 10)",
+        11 => "wpa_supplicant timed out while forming the P2P group (reason 11)",
+        _ => $"reason {reason}",
+    };
+
     private static bool IsSupplicantTemporarilyUnavailable(DBusException exception) =>
         exception.ErrorName is DeviceNotActiveError
             or "org.freedesktop.DBus.Error.ServiceUnknown"
@@ -889,6 +961,7 @@ public interface IWpaP2PDevice : IDBusObject
     Task FindAsync(IDictionary<string, object> options);
     Task ListenAsync(int timeout);
     Task StopFindAsync();
+    Task<string> ConnectAsync(IDictionary<string, object> options);
     Task<T> GetAsync<T>(string property);
     Task SetAsync(string property, object value);
     Task<IDisposable> WatchProvisionDiscoveryPBCRequestAsync(
@@ -917,6 +990,12 @@ public interface IWpaP2PDevice : IDBusObject
         Action<Exception>? onError = null);
     Task<IDisposable> WatchGONegotiationFailureAsync(
         Action<IDictionary<string, object>> handler,
+        Action<Exception>? onError = null);
+    Task<IDisposable> WatchGONegotiationSuccessAsync(
+        Action<IDictionary<string, object>> handler,
+        Action<Exception>? onError = null);
+    Task<IDisposable> WatchGroupFormationFailureAsync(
+        Action<string> handler,
         Action<Exception>? onError = null);
 }
 
