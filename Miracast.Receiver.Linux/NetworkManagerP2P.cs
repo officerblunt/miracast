@@ -271,11 +271,6 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
 
     private async Task ResetStaleP2PStateAsync(IWpaP2PDevice p2pDevice)
     {
-        if (_p2pDevice is not null)
-        {
-            try { await _p2pDevice.StopFindAsync().ConfigureAwait(false); }
-            catch (Exception) { }
-        }
         try { await p2pDevice.CancelAsync().ConfigureAwait(false); }
         catch (Exception) { }
         try { await p2pDevice.StopFindAsync().ConfigureAwait(false); }
@@ -291,12 +286,6 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             try { await _groupP2PDevice.DisconnectAsync().ConfigureAwait(false); }
             catch (Exception exception) { Report($"Could not disconnect the P2P group: {exception.Message}"); }
             _groupP2PDevice = null;
-        }
-
-        if (_p2pDevice is not null)
-        {
-            try { await _p2pDevice.StopFindAsync().ConfigureAwait(false); }
-            catch (Exception exception) { Report($"Could not stop NetworkManager P2P discovery: {exception.Message}"); }
         }
 
         var p2pDevice = _supplicantP2PDevice;
@@ -427,7 +416,9 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         var supplicantInterface = _supplicantInterface
             ?? throw new InvalidOperationException("The wpa_supplicant Wi-Fi interface proxy is unavailable.");
         var reported = false;
-        while (await supplicantInterface.GetAsync<bool>("Scanning")
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (DateTime.UtcNow < deadline
+               && await supplicantInterface.GetAsync<bool>("Scanning")
                    .WaitAsync(cancellationToken).ConfigureAwait(false))
         {
             if (!reported)
@@ -438,6 +429,12 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                 reported = true;
             }
             await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+        }
+        if (reported && DateTime.UtcNow >= deadline)
+        {
+            Report(
+                "The existing Wi-Fi scan did not finish within 10 seconds. "
+                + "Attempting Wi-Fi Direct discovery directly…");
         }
     }
 
@@ -466,12 +463,13 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                         _initialP2PResetCompleted = true;
                     }
                     await WaitForPendingScanAsync(cancellationToken).ConfigureAwait(false);
-                    await _p2pDevice.StartFindAsync(new Dictionary<string, object>
+                    await p2pDevice.FindAsync(new Dictionary<string, object>
                     {
-                        ["timeout"] = 600,
+                        ["Timeout"] = 600,
+                        ["DiscoveryType"] = "start_with_full",
                     }).WaitAsync(cancellationToken).ConfigureAwait(false);
-                    // NetworkManager owns the Find lifetime. Re-apply the Sink identity
-                    // in case it updated supplicant settings while starting discovery.
+                    // Direct supplicant Find alternates Search and Listen states and
+                    // keeps the WFD Sink information in its Probe Responses.
                     await ConfigureWfdAdvertisementAsync(cancellationToken).ConfigureAwait(false);
                     await VerifyWfdAdvertisementAsync(cancellationToken).ConfigureAwait(false);
                     _finding = true;
@@ -1002,12 +1000,6 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     {
         if (disable)
             _shouldFind = false;
-        if (_p2pDevice is not null)
-        {
-            try { await _p2pDevice.StopFindAsync().ConfigureAwait(false); }
-            catch (DBusException) { }
-            catch (Exception exception) { Report($"Could not stop NetworkManager P2P discovery: {exception.Message}"); }
-        }
         if (_supplicantP2PDevice is not null)
         {
             try { await _supplicantP2PDevice.StopFindAsync().ConfigureAwait(false); }
