@@ -215,7 +215,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             var options = new Dictionary<string, object>
             {
                 ["persist"] = "volatile",
-                ["bind-activation"] = "dbus-name",
+                ["bind-activation"] = "dbus-client",
             };
 
             (ObjectPath connection, ObjectPath activeConnection, IDictionary<string, object> result) result;
