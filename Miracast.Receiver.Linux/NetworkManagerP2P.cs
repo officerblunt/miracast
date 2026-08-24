@@ -176,6 +176,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
 
             await StopFindAsync(disable: true).ConfigureAwait(false);
             Report($"{peer.Name} requested a connection. Confirming WPS Push Button automatically…");
+            await ReportConcurrentWifiConnectionsAsync(cancellationToken).ConfigureAwait(false);
 
             var device = _bus.CreateProxy<INetworkManagerDevice>(Service, _devicePath);
             var activated = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -234,7 +235,6 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             }
             _activeConnection = result.activeConnection;
             Report("NetworkManager accepted the P2P activation. Completing WPS pairing…");
-            await AuthorizePendingGoNegotiationAsync(peer, cancellationToken).ConfigureAwait(false);
 
             var state = await device.GetAsync<uint>("State").WaitAsync(cancellationToken).ConfigureAwait(false);
             if (state == DeviceStateActivated)
@@ -575,55 +575,33 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         }
     }
 
-    private async Task AuthorizePendingGoNegotiationAsync(
-        WifiP2PPeer peer,
-        CancellationToken cancellationToken)
+    private async Task ReportConcurrentWifiConnectionsAsync(CancellationToken cancellationToken)
     {
-        var p2pDevice = _supplicantP2PDevice
-            ?? throw new InvalidOperationException("The wpa_supplicant P2P interface is unavailable.");
-        var targetAddress = NormalizeHardwareAddress(peer.HardwareAddress);
-        var supplicantPeers = await p2pDevice.GetAsync<ObjectPath[]>("Peers")
-            .WaitAsync(cancellationToken).ConfigureAwait(false);
+        if (_networkManager is null)
+            return;
 
-        ObjectPath? targetPath = null;
-        foreach (var path in supplicantPeers)
+        var devices = await _networkManager.GetDevicesAsync()
+            .WaitAsync(cancellationToken).ConfigureAwait(false);
+        var activeInterfaces = new List<string>();
+        foreach (var path in devices)
         {
-            var supplicantPeer = _bus.CreateProxy<IWpaPeer>(SupplicantService, path);
-            var addressBytes = await supplicantPeer.GetAsync<byte[]>("DeviceAddress")
-                .WaitAsync(cancellationToken).ConfigureAwait(false);
-            if (Convert.ToHexString(addressBytes).Equals(targetAddress, StringComparison.OrdinalIgnoreCase))
+            var device = _bus.CreateProxy<INetworkManagerDevice>(Service, path);
+            if (await device.GetAsync<uint>("DeviceType").WaitAsync(cancellationToken).ConfigureAwait(false) != 2
+                || await device.GetAsync<uint>("State").WaitAsync(cancellationToken).ConfigureAwait(false)
+                    != DeviceStateActivated)
             {
-                targetPath = path;
-                break;
+                continue;
             }
+
+            activeInterfaces.Add(
+                await device.GetAsync<string>("Interface").WaitAsync(cancellationToken).ConfigureAwait(false));
         }
 
-        if (targetPath is null)
+        if (activeInterfaces.Count > 0)
         {
             Report(
-                $"NetworkManager started WPS, but wpa_supplicant no longer exposes peer "
-                + $"{peer.HardwareAddress} for incoming authorization.");
-            return;
-        }
-
-        try
-        {
-            await p2pDevice.ConnectAsync(new Dictionary<string, object>
-            {
-                ["peer"] = targetPath.Value,
-                ["persistent"] = false,
-                ["authorize_only"] = true,
-                ["go_intent"] = 0,
-                ["wps_method"] = "pbc",
-            }).WaitAsync(cancellationToken).ConfigureAwait(false);
-            Report($"Authorized the incoming GO negotiation from {peer.Name}; waiting for WPS…");
-        }
-        catch (DBusException exception)
-        {
-            // NetworkManager may have already authorized the same request between
-            // AddAndActivateConnection2 returning and this call. Keep its activation
-            // alive, but retain the exact supplicant response in the UI.
-            Report($"Direct GO authorization returned {exception.ErrorName}: {exception.Message}");
+                $"Warning: {string.Join(", ", activeInterfaces)} is connected to regular Wi-Fi. "
+                + "If P2P times out, disconnect that Wi-Fi connection and retry over Ethernet.");
         }
     }
 
@@ -961,7 +939,6 @@ public interface IWpaP2PDevice : IDBusObject
     Task FindAsync(IDictionary<string, object> options);
     Task ListenAsync(int timeout);
     Task StopFindAsync();
-    Task<string> ConnectAsync(IDictionary<string, object> options);
     Task<T> GetAsync<T>(string property);
     Task SetAsync(string property, object value);
     Task<IDisposable> WatchProvisionDiscoveryPBCRequestAsync(

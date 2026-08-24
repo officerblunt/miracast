@@ -166,7 +166,7 @@ public partial class MainWindow : Window
     private Task StopPlaybackAsync() => _videoRenderer.StopAsync();
 
     private void SetStatus(string status) =>
-        Dispatcher.UIThread.Post(() => ViewModel.Status = status);
+        Dispatcher.UIThread.Post(() => ViewModel.AppendStatus(status));
 
     private async void OnClosing(object? sender, WindowClosingEventArgs args)
     {

@@ -65,11 +65,14 @@
 
         <Border VerticalAlignment="Bottom"
                 Background="#B0000000"
-                Padding="16,10">
-            <TextBlock Text="{Binding Status}"
-                       Foreground="White"
-                       FontSize="14"
-                       TextWrapping="Wrap" />
+                Padding="16,10"
+                MaxHeight="220">
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                <TextBlock Text="{Binding StatusHistory}"
+                           Foreground="White"
+                           FontSize="13"
+                           TextWrapping="Wrap" />
+            </ScrollViewer>
         </Border>
     </Grid>
 
