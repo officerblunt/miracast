@@ -28,6 +28,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private INetworkManager? _networkManager;
     private IWpaSupplicant? _supplicant;
     private IWpaP2PDevice? _supplicantP2PDevice;
+    private IWpaInterface? _supplicantInterface;
     private IWpaP2PDevice? _groupP2PDevice;
     private IWpaWps? _supplicantWps;
     private IWifiP2PDevice? _p2pDevice;
@@ -421,6 +422,25 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         return 7236;
     }
 
+    private async Task WaitForPendingScanAsync(CancellationToken cancellationToken)
+    {
+        var supplicantInterface = _supplicantInterface
+            ?? throw new InvalidOperationException("The wpa_supplicant Wi-Fi interface proxy is unavailable.");
+        var reported = false;
+        while (await supplicantInterface.GetAsync<bool>("Scanning")
+                   .WaitAsync(cancellationToken).ConfigureAwait(false))
+        {
+            if (!reported)
+            {
+                Report(
+                    "The physical Wi-Fi adapter is finishing an existing scan. "
+                    + "Waiting before starting Wi-Fi Direct discovery…");
+                reported = true;
+            }
+            await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
     private async Task StartDiscoveryAsync(CancellationToken cancellationToken)
     {
         if (_p2pDevice is null || cancellationToken.IsCancellationRequested)
@@ -430,6 +450,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         {
             _shouldFind = true;
             var waitingReported = false;
+            var busyReported = false;
             while (_shouldFind && !cancellationToken.IsCancellationRequested)
             {
                 try
@@ -444,6 +465,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                         await ResetStaleP2PStateAsync(p2pDevice).ConfigureAwait(false);
                         _initialP2PResetCompleted = true;
                     }
+                    await WaitForPendingScanAsync(cancellationToken).ConfigureAwait(false);
                     await _p2pDevice.StartFindAsync(new Dictionary<string, object>
                     {
                         ["timeout"] = 600,
@@ -466,6 +488,21 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                         waitingReported = true;
                     }
                     await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken).ConfigureAwait(false);
+                }
+                catch (DBusException exception) when (IsP2PFindBusy(exception))
+                {
+                    _finding = false;
+                    if (!busyReported)
+                    {
+                        Report(
+                            "The Wi-Fi driver still has a scan pending. "
+                            + "Cleaning the P2P operation and retrying without restarting NetworkManager…");
+                        busyReported = true;
+                    }
+                    var p2pDevice = _supplicantP2PDevice;
+                    if (p2pDevice is not null)
+                        await ResetStaleP2PStateAsync(p2pDevice).ConfigureAwait(false);
+                    await Task.Delay(TimeSpan.FromSeconds(3), cancellationToken).ConfigureAwait(false);
                 }
             }
         }
@@ -524,6 +561,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                     var existing = await candidate.GetAsync<IDictionary<string, object>>("P2PDeviceConfig")
                         .WaitAsync(cancellationToken).ConfigureAwait(false);
                     _supplicantP2PDevice = candidate;
+                    _supplicantInterface = _bus.CreateProxy<IWpaInterface>(SupplicantService, path);
                     _supplicantWps = _bus.CreateProxy<IWpaWps>(SupplicantService, path);
                     if (existing.TryGetValue("DeviceName", out var name) && name is string deviceName)
                         _previousP2PDeviceName = deviceName;
@@ -846,6 +884,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             _wpsConfigured = false;
             _incomingRequestSubscriptionsConfigured = false;
             _supplicantP2PDevice = null;
+            _supplicantInterface = null;
             _supplicantWps = null;
             _previousP2PDeviceName = null;
             _previousPrimaryDeviceType = null;
@@ -874,6 +913,11 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         exception.ErrorName is DeviceNotActiveError
             or "org.freedesktop.DBus.Error.ServiceUnknown"
             or "org.freedesktop.DBus.Error.NameHasNoOwner";
+
+    private static bool IsP2PFindBusy(DBusException exception) =>
+        exception.Message.Contains("Could not start P2P find", StringComparison.OrdinalIgnoreCase)
+        || exception.Message.Contains("scan trigger", StringComparison.OrdinalIgnoreCase)
+        || exception.Message.Contains("scan pending", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsAccessDenied(DBusException exception) =>
         exception.ErrorName is "org.freedesktop.DBus.Error.AccessDenied"
@@ -1110,6 +1154,12 @@ public interface IWpaWps : IDBusObject
 {
     Task<T> GetAsync<T>(string property);
     Task SetAsync(string property, object value);
+}
+
+[DBusInterface("fi.w1.wpa_supplicant1.Interface")]
+public interface IWpaInterface : IDBusObject
+{
+    Task<T> GetAsync<T>(string property);
 }
 
 [DBusInterface("fi.w1.wpa_supplicant1.Peer")]
