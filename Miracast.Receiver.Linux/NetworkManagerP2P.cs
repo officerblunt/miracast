@@ -766,83 +766,35 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     {
         try
         {
-            if (!properties.TryGetValue("interface_object", out var interfaceValue)
-                || interfaceValue is not ObjectPath interfacePath)
-            {
-                throw new InvalidOperationException("wpa_supplicant did not report the P2P group interface.");
-            }
-
-            var interfaceName = await _bus.CreateProxy<IWpaInterface>(SupplicantService, interfacePath)
-                .GetAsync<string>("Ifname").WaitAsync(cancellationToken).ConfigureAwait(false);
             var peer = GetAuthorizedPeer()
                 ?? throw new InvalidOperationException("The peer that created the P2P group is no longer available.");
             var signalledLocalAddress = GetGroupAddress(properties, "IpAddr");
             var signalledSourceAddress = GetGroupAddress(properties, "IpAddrGo");
             var controlPort = GetWfdControlPort(peer.WfdIEs);
 
-            Report($"P2P group {interfaceName} formed; waiting for its IPv4 configuration…");
+            if (signalledLocalAddress is null || signalledSourceAddress is null)
+            {
+                throw new InvalidOperationException(
+                    "wpa_supplicant formed the P2P client group without reporting its negotiated IPv4 addresses.");
+            }
+
+            Report(
+                $"P2P group formed; waiting for {signalledLocalAddress} to appear on its network interface…");
             var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(20);
             while (DateTime.UtcNow < deadline)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-
-                INetworkManagerDevice? networkManagerDevice = null;
-                try
-                {
-                    networkManagerDevice = await FindNetworkManagerDeviceAsync(interfaceName, cancellationToken)
-                        .ConfigureAwait(false);
-                }
-                catch (DBusException)
-                {
-                    // NetworkManager may publish the group device while it is still being created.
-                }
-                if (networkManagerDevice is not null)
-                {
-                    try
-                    {
-                        var state = await networkManagerDevice.GetAsync<uint>("State")
-                            .WaitAsync(cancellationToken).ConfigureAwait(false);
-                        if (state == DeviceStateActivated)
-                        {
-                            var context = await CreateConnectionContextAsync(
-                                    networkManagerDevice,
-                                    peer,
-                                    cancellationToken)
-                                .ConfigureAwait(false);
-                            PeerConnected?.Invoke(this, context);
-                            return;
-                        }
-                        if (state == DeviceStateFailed)
-                        {
-                            var stateReason = await networkManagerDevice.GetAsync<(uint state, uint reason)>("StateReason")
-                                .WaitAsync(cancellationToken).ConfigureAwait(false);
-                            throw new InvalidOperationException(
-                                $"NetworkManager failed to configure {interfaceName}: "
-                                + DescribeDeviceStateReason(stateReason.reason) + ".");
-                        }
-                    }
-                    catch (DBusException)
-                    {
-                        // The short-lived group device can disappear between property reads.
-                    }
-                    catch (InvalidOperationException)
-                    {
-                        // Some NetworkManager versions expose the group device before
-                        // attaching Ip4Config; the kernel-address fallback below handles it.
-                    }
-                }
-
-                var configuredLocalAddress = GetConfiguredInterfaceAddress(interfaceName, signalledLocalAddress);
-                if (configuredLocalAddress is not null && signalledSourceAddress is not null)
+                var configuredInterface = GetConfiguredInterface(signalledLocalAddress);
+                if (configuredInterface is not null)
                 {
                     var context = new P2PConnectionContext(
                         peer,
-                        interfaceName,
-                        configuredLocalAddress,
+                        configuredInterface.Value.Name,
+                        configuredInterface.Value.Address,
                         signalledSourceAddress,
                         controlPort);
                     Report(
-                        $"P2P ready on {interfaceName}: {configuredLocalAddress} → "
+                        $"P2P ready on {configuredInterface.Value.Name}: {configuredInterface.Value.Address} → "
                         + $"{signalledSourceAddress}:{controlPort}.");
                     PeerConnected?.Invoke(this, context);
                     return;
@@ -851,12 +803,9 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                 await Task.Delay(250, cancellationToken).ConfigureAwait(false);
             }
 
-            var negotiatedAddresses = signalledLocalAddress is not null && signalledSourceAddress is not null
-                ? $" Negotiated addresses were {signalledLocalAddress} → {signalledSourceAddress}."
-                : string.Empty;
             throw new TimeoutException(
-                $"The P2P group '{interfaceName}' formed, but its IPv4 address was not applied within 20 seconds."
-                + negotiatedAddresses);
+                $"The P2P group formed, but its negotiated IPv4 address {signalledLocalAddress} "
+                + "was not applied to a network interface within 20 seconds.");
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -877,26 +826,6 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             : null;
     }
 
-    private async Task<INetworkManagerDevice?> FindNetworkManagerDeviceAsync(
-        string interfaceName,
-        CancellationToken cancellationToken)
-    {
-        var networkManager = _networkManager;
-        if (networkManager is null)
-            return null;
-
-        var devices = await networkManager.GetDevicesAsync().WaitAsync(cancellationToken).ConfigureAwait(false);
-        foreach (var path in devices)
-        {
-            var device = _bus.CreateProxy<INetworkManagerDevice>(Service, path);
-            var candidateName = await device.GetAsync<string>("Interface")
-                .WaitAsync(cancellationToken).ConfigureAwait(false);
-            if (candidateName.Equals(interfaceName, StringComparison.Ordinal))
-                return device;
-        }
-        return null;
-    }
-
     internal static IPAddress? GetGroupAddress(IDictionary<string, object> properties, string name) =>
         properties.TryGetValue(name, out var value)
         && value is byte[] bytes
@@ -905,19 +834,19 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             ? new IPAddress(bytes)
             : null;
 
-    private static IPAddress? GetConfiguredInterfaceAddress(
-        string interfaceName,
-        IPAddress? expectedAddress)
+    private static (string Name, IPAddress Address)? GetConfiguredInterface(IPAddress expectedAddress)
     {
         try
         {
-            return NetworkInterface.GetAllNetworkInterfaces()
-                .FirstOrDefault(item => item.Name.Equals(interfaceName, StringComparison.Ordinal))?
-                .GetIPProperties().UnicastAddresses
-                .Select(item => item.Address)
-                .FirstOrDefault(item =>
-                    item.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork
-                    && (expectedAddress is null || item.Equals(expectedAddress)));
+            foreach (var networkInterface in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                var address = networkInterface.GetIPProperties().UnicastAddresses
+                    .Select(item => item.Address)
+                    .FirstOrDefault(item => item.Equals(expectedAddress));
+                if (address is not null)
+                    return (networkInterface.Name, address);
+            }
+            return null;
         }
         catch (NetworkInformationException)
         {
