@@ -825,7 +825,16 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
 
             var p2pDevice = _supplicantP2PDevice;
             if (p2pDevice is not null)
-                await p2pDevice.CancelAsync().ConfigureAwait(false);
+            {
+                try
+                {
+                    await p2pDevice.CancelAsync().ConfigureAwait(false);
+                }
+                catch (DBusException exception) when (IsP2PCancelAlreadyFinished(exception))
+                {
+                    // wpa_supplicant's own group-formation timeout already ended the operation.
+                }
+            }
             ResetPendingAuthorization();
             QueueDiscoveryRestart("the previous group formation timed out");
         }
@@ -1169,6 +1178,9 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         exception.Message.Contains("Could not start P2P find", StringComparison.OrdinalIgnoreCase)
         || exception.Message.Contains("scan trigger", StringComparison.OrdinalIgnoreCase)
         || exception.Message.Contains("scan pending", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsP2PCancelAlreadyFinished(DBusException exception) =>
+        exception.Message.Contains("P2P cancel failed", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsInvalidArguments(DBusException exception) =>
         exception.ErrorName is "fi.w1.wpa_supplicant1.InvalidArgs"
