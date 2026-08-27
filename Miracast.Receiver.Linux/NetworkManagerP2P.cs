@@ -463,11 +463,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                         _initialP2PResetCompleted = true;
                     }
                     await WaitForPendingScanAsync(cancellationToken).ConfigureAwait(false);
-                    await p2pDevice.FindAsync(new Dictionary<string, object>
-                    {
-                        ["Timeout"] = 600,
-                        ["DiscoveryType"] = "start_with_full",
-                    }).WaitAsync(cancellationToken).ConfigureAwait(false);
+                    await StartSupplicantFindAsync(p2pDevice, cancellationToken).ConfigureAwait(false);
                     // Direct supplicant Find alternates Search and Listen states and
                     // keeps the WFD Sink information in its Probe Responses.
                     await ConfigureWfdAdvertisementAsync(cancellationToken).ConfigureAwait(false);
@@ -508,6 +504,51 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         {
             _discoveryGate.Release();
         }
+    }
+
+    private async Task StartSupplicantFindAsync(
+        IWpaP2PDevice p2pDevice,
+        CancellationToken cancellationToken)
+    {
+        IReadOnlyList<IDictionary<string, object>> optionVariants =
+        [
+            new Dictionary<string, object>
+            {
+                ["Timeout"] = 600,
+                ["DiscoveryType"] = "start_with_full",
+            },
+            new Dictionary<string, object>
+            {
+                ["Timeout"] = 600,
+            },
+            new Dictionary<string, object>(),
+        ];
+
+        DBusException? lastInvalidArguments = null;
+        for (var index = 0; index < optionVariants.Count; index++)
+        {
+            try
+            {
+                await p2pDevice.FindAsync(optionVariants[index])
+                    .WaitAsync(cancellationToken).ConfigureAwait(false);
+                if (index > 0)
+                {
+                    Report(
+                        "This wpa_supplicant accepts only the compatibility form of P2P Find; "
+                        + "discovery was started without unsupported optional arguments.");
+                }
+                return;
+            }
+            catch (DBusException exception) when (IsInvalidArguments(exception))
+            {
+                lastInvalidArguments = exception;
+            }
+        }
+
+        throw new InvalidOperationException(
+            "wpa_supplicant rejected every supported P2P Find argument form. "
+            + "Check that its fi.w1.wpa_supplicant1.Interface.P2PDevice API matches the installed daemon.",
+            lastInvalidArguments);
     }
 
     private async Task ConfigureWfdAdvertisementAsync(CancellationToken cancellationToken)
@@ -916,6 +957,10 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         exception.Message.Contains("Could not start P2P find", StringComparison.OrdinalIgnoreCase)
         || exception.Message.Contains("scan trigger", StringComparison.OrdinalIgnoreCase)
         || exception.Message.Contains("scan pending", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsInvalidArguments(DBusException exception) =>
+        exception.ErrorName is "fi.w1.wpa_supplicant1.InvalidArgs"
+            or "org.freedesktop.DBus.Error.InvalidArgs";
 
     private static bool IsAccessDenied(DBusException exception) =>
         exception.ErrorName is "org.freedesktop.DBus.Error.AccessDenied"
