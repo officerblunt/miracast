@@ -40,6 +40,8 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private Task? _findRestart;
     private Task? _groupStartup;
     private CancellationTokenSource? _groupLifetime;
+    private Task? _groupFormationWatchdog;
+    private CancellationTokenSource? _groupFormationLifetime;
     private bool _finding;
     private bool _shouldFind;
     private bool _wfdAdvertisementConfigured;
@@ -240,6 +242,16 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     {
         _shouldFind = false;
         _lifetime?.Cancel();
+        _groupFormationLifetime?.Cancel();
+        var groupFormationWatchdog = _groupFormationWatchdog;
+        if (groupFormationWatchdog is not null)
+        {
+            try { await groupFormationWatchdog.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+            _groupFormationWatchdog = null;
+        }
+        _groupFormationLifetime?.Dispose();
+        _groupFormationLifetime = null;
         _groupLifetime?.Cancel();
         if (_groupStartup is not null)
         {
@@ -696,15 +708,15 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                 exception => Report($"Could not monitor incoming GO negotiation: {exception.Message}"))
                 .WaitAsync(cancellationToken).ConfigureAwait(false));
             _subscriptions.Add(await p2pDevice.WatchGONegotiationFailureAsync(
-                properties => Report($"Wi-Fi Direct GO negotiation failed: {FormatProperties(properties)}"),
+                OnGONegotiationFailure,
                 exception => Report($"Could not monitor GO negotiation failures: {exception.Message}"))
                 .WaitAsync(cancellationToken).ConfigureAwait(false));
             _subscriptions.Add(await p2pDevice.WatchGONegotiationSuccessAsync(
-                properties => Report($"Wi-Fi Direct GO negotiation succeeded: {FormatProperties(properties)}"),
+                OnGONegotiationSuccess,
                 exception => Report($"Could not monitor GO negotiation success: {exception.Message}"))
                 .WaitAsync(cancellationToken).ConfigureAwait(false));
             _subscriptions.Add(await p2pDevice.WatchGroupFormationFailureAsync(
-                reason => Report($"Wi-Fi Direct group formation failed: {reason}"),
+                OnGroupFormationFailure,
                 exception => Report($"Could not monitor group formation failures: {exception.Message}"))
                 .WaitAsync(cancellationToken).ConfigureAwait(false));
             _subscriptions.Add(await p2pDevice.WatchGroupStartedAsync(
@@ -733,6 +745,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
 
     private void OnGroupStarted(IDictionary<string, object> properties)
     {
+        CancelGroupFormationWatchdog();
         _authorizationExpiresAt = DateTime.MaxValue;
         if (properties.TryGetValue("interface_object", out var interfaceValue)
             && interfaceValue is ObjectPath interfacePath)
@@ -751,13 +764,87 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
 
     private void OnGroupFinished(IDictionary<string, object> properties)
     {
+        CancelGroupFormationWatchdog();
         _groupLifetime?.Cancel();
         _groupP2PDevice = null;
+        ResetPendingAuthorization();
+        Report($"Wi-Fi Direct group finished: {FormatProperties(properties)}");
+        QueueDiscoveryRestart("the previous Wi-Fi Direct group finished");
+    }
+
+    private void OnGONegotiationSuccess(IDictionary<string, object> properties)
+    {
+        Report($"Wi-Fi Direct GO negotiation succeeded: {FormatProperties(properties)}");
+        Report("Waiting up to 20 seconds for WPS to finish creating the Wi-Fi Direct group…");
+        StartGroupFormationWatchdog();
+    }
+
+    private void OnGONegotiationFailure(IDictionary<string, object> properties)
+    {
+        CancelGroupFormationWatchdog();
+        ResetPendingAuthorization();
+        Report($"Wi-Fi Direct GO negotiation failed: {FormatProperties(properties)}");
+        QueueDiscoveryRestart("GO negotiation failed");
+    }
+
+    private void OnGroupFormationFailure(string reason)
+    {
+        CancelGroupFormationWatchdog();
+        ResetPendingAuthorization();
+        Report($"Wi-Fi Direct group formation failed: {reason}");
+        QueueDiscoveryRestart("group formation failed");
+    }
+
+    private void StartGroupFormationWatchdog()
+    {
+        var lifetime = _lifetime;
+        if (lifetime is null || lifetime.IsCancellationRequested)
+            return;
+
+        CancelGroupFormationWatchdog();
+        _groupFormationLifetime = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        _groupFormationWatchdog = WatchGroupFormationAsync(_groupFormationLifetime.Token);
+    }
+
+    private void CancelGroupFormationWatchdog()
+    {
+        _groupFormationLifetime?.Cancel();
+        _groupFormationLifetime?.Dispose();
+        _groupFormationLifetime = null;
+        _groupFormationWatchdog = null;
+    }
+
+    private async Task WatchGroupFormationAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(20), cancellationToken).ConfigureAwait(false);
+            Report(
+                "Wi-Fi Direct GO negotiation succeeded, but WPS did not create the group within 20 seconds. "
+                + "Cancelling the stalled operation; concurrent regular Wi-Fi on this adapter may be the cause.");
+
+            var p2pDevice = _supplicantP2PDevice;
+            if (p2pDevice is not null)
+                await p2pDevice.CancelAsync().ConfigureAwait(false);
+            ResetPendingAuthorization();
+            QueueDiscoveryRestart("the previous group formation timed out");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            ResetPendingAuthorization();
+            Report($"Could not recover from the stalled P2P group formation: {exception.Message}");
+            QueueDiscoveryRestart("the previous group formation stalled");
+        }
+    }
+
+    private void ResetPendingAuthorization()
+    {
         _authorizationExpiresAt = DateTime.MinValue;
         _authorizedPeerAddress = null;
         _authorizedPeer = null;
-        Report($"Wi-Fi Direct group finished: {FormatProperties(properties)}");
-        QueueDiscoveryRestart("the previous Wi-Fi Direct group finished");
     }
 
     private async Task CompleteGroupStartupAsync(
@@ -1136,11 +1223,18 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     {
         try
         {
-            var authorizationDelay = _authorizationExpiresAt - DateTime.UtcNow;
-            var delay = authorizationDelay > TimeSpan.Zero && authorizationDelay < TimeSpan.FromMinutes(2)
-                ? authorizationDelay
-                : TimeSpan.FromMilliseconds(750);
-            await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+            while (true)
+            {
+                var authorizationDelay = _authorizationExpiresAt - DateTime.UtcNow;
+                if (authorizationDelay <= TimeSpan.Zero || authorizationDelay >= TimeSpan.FromMinutes(2))
+                    break;
+                await Task.Delay(
+                    authorizationDelay < TimeSpan.FromSeconds(1)
+                        ? authorizationDelay
+                        : TimeSpan.FromSeconds(1),
+                    cancellationToken).ConfigureAwait(false);
+            }
+            await Task.Delay(TimeSpan.FromMilliseconds(750), cancellationToken).ConfigureAwait(false);
             if (!_shouldFind || _groupP2PDevice is not null)
                 return;
             Report($"Restarting Wi-Fi Direct discovery because {reason}…");
