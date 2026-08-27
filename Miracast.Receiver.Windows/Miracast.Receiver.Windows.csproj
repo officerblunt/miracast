@@ -18,10 +18,10 @@
 
   <ItemGroup>
     <Reference Include="Microsoft.Windows.SDK.NET"
-               HintPath="$(NuGetPackageRoot)microsoft.windows.sdk.net.ref\$(WindowsSdkNetRefVersion)\lib\net8.0\Microsoft.Windows.SDK.NET.dll"
+               HintPath="$(NuGetPackageRoot)\microsoft.windows.sdk.net.ref\$(WindowsSdkNetRefVersion)\lib\net8.0\Microsoft.Windows.SDK.NET.dll"
                Private="true" />
     <Reference Include="WinRT.Runtime"
-               HintPath="$(NuGetPackageRoot)microsoft.windows.sdk.net.ref\$(WindowsSdkNetRefVersion)\lib\net8.0\WinRT.Runtime.dll"
+               HintPath="$(NuGetPackageRoot)\microsoft.windows.sdk.net.ref\$(WindowsSdkNetRefVersion)\lib\net8.0\WinRT.Runtime.dll"
                Private="true" />
   </ItemGroup>
 

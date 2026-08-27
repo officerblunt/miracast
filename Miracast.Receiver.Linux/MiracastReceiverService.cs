@@ -1,19 +1,20 @@
-using System.Diagnostics;
 using System.Runtime.InteropServices;
-using System.Text.RegularExpressions;
 using Miracast.Receiver.Entities.EventArgs;
+using Tmds.DBus;
 
 namespace Miracast.Receiver.Linux;
 
-public sealed partial class MiracastReceiverService : IMiracastReceiverService, IAsyncDisposable
+public sealed class MiracastReceiverService : IMiracastReceiverService, IAsyncDisposable
 {
+    public const int RtspPort = 7236;
     public const int RtpPort = 7236;
 
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
-    private Process? _wifid;
-    private Process? _sinkctl;
-    private CancellationTokenSource? _outputCancellation;
+    private WpaSupplicantP2pController? _p2pController;
+    private WfdRtspServer? _rtspServer;
+    private CancellationTokenSource? _running;
     private string? _wifiInterface;
+    private int _connectionAnnounced;
     private int _videoAnnounced;
     private bool _started;
 
@@ -25,7 +26,7 @@ public sealed partial class MiracastReceiverService : IMiracastReceiverService, 
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
         if (!OperatingSystem.IsLinux())
-            throw new PlatformNotSupportedException("MiracleCast receiver can only run on Linux.");
+            throw new PlatformNotSupportedException("The wpa_supplicant Miracast receiver can only run on Linux.");
         if (GetEffectiveUserId() == 0)
             throw new InvalidOperationException("Do not run the receiver as root; start it as the desktop user.");
 
@@ -36,37 +37,31 @@ public sealed partial class MiracastReceiverService : IMiracastReceiverService, 
                 return;
 
             _wifiInterface = await FindWifiInterfaceAsync(cancellationToken).ConfigureAwait(false);
+            var friendlyName = GetFriendlyName();
+            _running = new CancellationTokenSource();
 
-            // These commands intentionally inherit the desktop user's identity. Do not add sudo/pkexec.
-            await RunCommandAsync("nmcli", ["device", "disconnect", _wifiInterface], cancellationToken, ignoreFailure: true)
-                .ConfigureAwait(false);
-            await RunCommandAsync("nmcli", ["device", "set", _wifiInterface, "managed", "no"], cancellationToken)
-                .ConfigureAwait(false);
-            await RunCommandAsync("systemctl", ["stop", "wpa_supplicant.service"], cancellationToken)
-                .ConfigureAwait(false);
+            _rtspServer = new WfdRtspServer(
+                Log,
+                AnnounceConnection,
+                AnnounceDisconnection,
+                AnnounceVideo);
+            await _rtspServer.StartAsync(cancellationToken).ConfigureAwait(false);
 
-            _outputCancellation = new CancellationTokenSource();
-            _wifid = StartProcess("miracle-wifid", ["--interface", _wifiInterface]);
-            _ = PumpOutputAsync(_wifid, HandleWifidLine, _outputCancellation.Token);
+            _p2pController = new WpaSupplicantP2pController(
+                _wifiInterface,
+                friendlyName,
+                Log,
+                AuthorizePeerAsync,
+                ConfigureGroupAsync,
+                GroupFinishedAsync);
+            await _p2pController.StartAsync(cancellationToken).ConfigureAwait(false);
 
-            await Task.Delay(500, cancellationToken).ConfigureAwait(false);
-
-            _sinkctl = StartProcess("miracle-sinkctl",
-                ["--external-player", "/bin/true", "--port", RtpPort.ToString()]);
-
-            var linkReady = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
-            _ = PumpOutputAsync(_sinkctl, line => HandleSinkLine(line, linkReady), _outputCancellation.Token);
-
-            var link = await linkReady.Task.WaitAsync(TimeSpan.FromSeconds(15), cancellationToken)
-                .ConfigureAwait(false);
-            await _sinkctl.StandardInput.WriteLineAsync($"run {link}").ConfigureAwait(false);
-            await _sinkctl.StandardInput.FlushAsync(cancellationToken).ConfigureAwait(false);
             _started = true;
-            LogReceived?.Invoke(this, $"MiracleCast is listening on {_wifiInterface} (link {link}).");
+            Log($"Miracast receiver '{friendlyName}' is listening on managed adapter {_wifiInterface}.");
         }
         catch
         {
-            await StopCoreAsync(CancellationToken.None).ConfigureAwait(false);
+            await StopCoreAsync().ConfigureAwait(false);
             throw;
         }
         finally
@@ -80,7 +75,7 @@ public sealed partial class MiracastReceiverService : IMiracastReceiverService, 
         await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await StopCoreAsync(cancellationToken).ConfigureAwait(false);
+            await StopCoreAsync().ConfigureAwait(false);
         }
         finally
         {
@@ -88,203 +83,166 @@ public sealed partial class MiracastReceiverService : IMiracastReceiverService, 
         }
     }
 
-    private async Task StopCoreAsync(CancellationToken cancellationToken)
+    private async Task AuthorizePeerAsync(ObjectPath peerPath)
     {
-        _started = false;
-        _outputCancellation?.Cancel();
-        StopProcess(_sinkctl);
-        StopProcess(_wifid);
-        _sinkctl = null;
-        _wifid = null;
-        _outputCancellation?.Dispose();
-        _outputCancellation = null;
-        Interlocked.Exchange(ref _videoAnnounced, 0);
+        var controller = _p2pController
+                         ?? throw new InvalidOperationException("The P2P controller is not running.");
+        var address = await controller.GetPeerAddressAsync(peerPath).ConfigureAwait(false);
+        Log($"Authorizing PBC request from {address}.");
+        await controller.AuthorizePeerAsync(peerPath).ConfigureAwait(false);
+    }
 
-        if (_wifiInterface is null)
+    private async Task ConfigureGroupAsync(P2pGroup group)
+    {
+        var controller = _p2pController
+                         ?? throw new InvalidOperationException("The P2P controller is not running.");
+        var groupInterface = await controller.GetInterfaceNameAsync(group.InterfacePath).ConfigureAwait(false);
+        Log($"P2P group started on {groupInterface}; role: {group.Role}.");
+
+        var cancellationToken = _running?.Token ?? CancellationToken.None;
+        var configurator = new NetworkManagerP2pConfigurator(Log);
+        await configurator.EnsureAddressAsync(groupInterface, group.Role, cancellationToken).ConfigureAwait(false);
+    }
+
+    private Task GroupFinishedAsync()
+    {
+        Log("P2P group finished.");
+        AnnounceDisconnection();
+        return Task.CompletedTask;
+    }
+
+    private void AnnounceConnection()
+    {
+        if (Interlocked.Exchange(ref _connectionAnnounced, 1) == 0)
+            ConnectionCreated?.Invoke(this, new ConnectionCreatedEventArgs());
+    }
+
+    private void AnnounceVideo(int width, int height)
+    {
+        AnnounceConnection();
+        if (Interlocked.Exchange(ref _videoAnnounced, 1) != 0)
             return;
 
-        // Best-effort restoration of the networking state changed during startup.
-        await RunCommandAsync("systemctl", ["start", "wpa_supplicant.service"], cancellationToken, ignoreFailure: true)
-            .ConfigureAwait(false);
-        await RunCommandAsync("nmcli", ["device", "set", _wifiInterface, "managed", "yes"], cancellationToken, ignoreFailure: true)
-            .ConfigureAwait(false);
-        await RunCommandAsync("nmcli", ["device", "connect", _wifiInterface], cancellationToken, ignoreFailure: true)
-            .ConfigureAwait(false);
-        _wifiInterface = null;
+        VideoReceived?.Invoke(this, new VideoReceivedEventArgs
+        {
+            Source = new VideoSource(new Uri($"rtp://@0.0.0.0:{RtpPort}"), width, height),
+        });
     }
 
-    private static Process StartProcess(string fileName, IReadOnlyList<string> arguments)
+    private void AnnounceDisconnection()
     {
-        var startInfo = CreateStartInfo(fileName, arguments);
-        startInfo.RedirectStandardInput = true;
+        Interlocked.Exchange(ref _videoAnnounced, 0);
+        if (Interlocked.Exchange(ref _connectionAnnounced, 0) == 1)
+            ConnectionClosed?.Invoke(this, new ConnectionClosedEventArgs());
+    }
 
+    private async Task StopCoreAsync()
+    {
+        _started = false;
+        _running?.Cancel();
+
+        var controller = _p2pController;
+        _p2pController = null;
         try
         {
-            return Process.Start(startInfo)
-                ?? throw new InvalidOperationException($"Could not start {fileName}.");
+            if (controller is not null)
+                await controller.DisposeAsync().ConfigureAwait(false);
         }
-        catch (System.ComponentModel.Win32Exception exception)
+        finally
         {
-            throw new InvalidOperationException(
-                $"Could not start '{fileName}'. Make sure it is installed and available in PATH.", exception);
+            var rtspServer = _rtspServer;
+            _rtspServer = null;
+            try
+            {
+                if (rtspServer is not null)
+                    await rtspServer.DisposeAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                _running?.Dispose();
+                _running = null;
+                _wifiInterface = null;
+                AnnounceDisconnection();
+            }
         }
     }
 
-    private static ProcessStartInfo CreateStartInfo(string fileName, IReadOnlyList<string> arguments)
-    {
-        var startInfo = new ProcessStartInfo(fileName)
-        {
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true,
-        };
-
-        foreach (var argument in arguments)
-            startInfo.ArgumentList.Add(argument);
-
-        return startInfo;
-    }
-
-    private async Task<string> FindWifiInterfaceAsync(CancellationToken cancellationToken)
+    private static async Task<string> FindWifiInterfaceAsync(CancellationToken cancellationToken)
     {
         var configuredInterface = Environment.GetEnvironmentVariable("MIRACAST_WIFI_INTERFACE");
         if (!string.IsNullOrWhiteSpace(configuredInterface))
             return configuredInterface.Trim();
 
-        var output = await RunCommandAsync(
-            "nmcli", ["-t", "-f", "DEVICE,TYPE", "device", "status"], cancellationToken).ConfigureAwait(false);
+        var output = await CommandRunner.RunAsync(
+                "nmcli",
+                ["-t", "-f", "DEVICE,TYPE,STATE", "device", "status"],
+                cancellationToken)
+            .ConfigureAwait(false);
 
-        foreach (var line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-        {
-            var separator = line.LastIndexOf(':');
-            if (separator > 0 && line[(separator + 1)..].Equals("wifi", StringComparison.OrdinalIgnoreCase))
-                return line[..separator].Replace("\\:", ":", StringComparison.Ordinal);
-        }
+        var adapters = output.Split(
+                '\n',
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(SplitNmcliLine)
+            .Where(fields => fields.Length >= 3
+                             && fields[1].Equals("wifi", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (adapters.Count == 0)
+            throw new InvalidOperationException("nmcli did not report a Wi-Fi interface.");
 
-        throw new InvalidOperationException("nmcli did not report a Wi-Fi interface.");
+        // Prefer an idle managed adapter. An active adapter remains a valid fallback
+        // when its driver supports concurrent infrastructure and P2P operation.
+        return adapters.FirstOrDefault(fields =>
+                   !fields[2].Equals("connected", StringComparison.OrdinalIgnoreCase))?[0]
+               ?? adapters[0][0];
     }
 
-    private static async Task<string> RunCommandAsync(
-        string fileName,
-        IReadOnlyList<string> arguments,
-        CancellationToken cancellationToken,
-        bool ignoreFailure = false)
+    internal static string[] SplitNmcliLine(string line)
     {
-        using var process = new Process { StartInfo = CreateStartInfo(fileName, arguments) };
-        try
+        var fields = new List<string>();
+        var value = new System.Text.StringBuilder();
+        var escaped = false;
+        foreach (var character in line.TrimEnd('\r'))
         {
-            if (!process.Start())
-                throw new InvalidOperationException($"Could not start {fileName}.");
-        }
-        catch (System.ComponentModel.Win32Exception exception)
-        {
-            throw new InvalidOperationException(
-                $"Could not start '{fileName}'. Make sure it is installed and available in PATH.", exception);
-        }
-
-        var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
-        var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
-        await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
-        var stdout = await stdoutTask.ConfigureAwait(false);
-        var stderr = await stderrTask.ConfigureAwait(false);
-
-        if (!ignoreFailure && process.ExitCode != 0)
-        {
-            var command = $"{fileName} {string.Join(' ', arguments)}";
-            throw new InvalidOperationException($"Command '{command}' failed: {stderr.Trim()}");
-        }
-
-        return stdout;
-    }
-
-    private async Task PumpOutputAsync(Process process, Action<string> handler, CancellationToken cancellationToken)
-    {
-        async Task ReadAsync(StreamReader reader)
-        {
-            while (!cancellationToken.IsCancellationRequested)
+            if (escaped)
             {
-                var line = await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false);
-                if (line is null)
-                    break;
-                handler(AnsiEscapeRegex().Replace(line, string.Empty));
+                value.Append(character);
+                escaped = false;
+            }
+            else if (character == '\\')
+            {
+                escaped = true;
+            }
+            else if (character == ':')
+            {
+                fields.Add(value.ToString());
+                value.Clear();
+            }
+            else
+            {
+                value.Append(character);
             }
         }
-
-        try
-        {
-            await Task.WhenAll(ReadAsync(process.StandardOutput), ReadAsync(process.StandardError)).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-        }
+        if (escaped)
+            value.Append('\\');
+        fields.Add(value.ToString());
+        return fields.ToArray();
     }
 
-    private void HandleWifidLine(string line) => LogReceived?.Invoke(this, line);
-
-    private void HandleSinkLine(string line, TaskCompletionSource<string> linkReady)
+    private static string GetFriendlyName()
     {
-        LogReceived?.Invoke(this, line);
-
-        var linkMatch = LinkRegex().Match(line);
-        if (linkMatch.Success)
-            linkReady.TrySetResult(linkMatch.Groups[1].Value);
-
-        if (line.Contains("SINK connected", StringComparison.OrdinalIgnoreCase))
-            ConnectionCreated?.Invoke(this, new ConnectionCreatedEventArgs());
-
-        if (line.Contains("SINK disconnected", StringComparison.OrdinalIgnoreCase))
-        {
-            Interlocked.Exchange(ref _videoAnnounced, 0);
-            ConnectionClosed?.Invoke(this, new ConnectionClosedEventArgs());
-        }
-
-        var resolutionMatch = ResolutionRegex().Match(line);
-        if (resolutionMatch.Success
-            && Interlocked.Exchange(ref _videoAnnounced, 1) == 0)
-        {
-            var width = int.Parse(resolutionMatch.Groups[1].Value);
-            var height = int.Parse(resolutionMatch.Groups[2].Value);
-            VideoReceived?.Invoke(this, new VideoReceivedEventArgs
-            {
-                Source = new VideoSource(new Uri($"rtp://@0.0.0.0:{RtpPort}"), width, height),
-            });
-        }
+        var configuredName = Environment.GetEnvironmentVariable("MIRACAST_FRIENDLY_NAME");
+        return string.IsNullOrWhiteSpace(configuredName)
+            ? $"{Environment.MachineName} Miracast"
+            : configuredName.Trim();
     }
 
-    private static void StopProcess(Process? process)
-    {
-        if (process is null)
-            return;
-
-        try
-        {
-            if (!process.HasExited)
-                process.Kill(entireProcessTree: true);
-        }
-        catch (InvalidOperationException)
-        {
-        }
-        finally
-        {
-            process.Dispose();
-        }
-    }
+    private void Log(string message) => LogReceived?.Invoke(this, message);
 
     public async ValueTask DisposeAsync()
     {
         await StopAsync().ConfigureAwait(false);
         _lifecycle.Dispose();
     }
-
-    [GeneratedRegex(@"\[ADD\]\s+Link:\s*(\d+)", RegexOptions.IgnoreCase)]
-    private static partial Regex LinkRegex();
-
-    [GeneratedRegex(@"SINK\s+set\s+resolution\D+(\d+)\s*x\s*(\d+)", RegexOptions.IgnoreCase)]
-    private static partial Regex ResolutionRegex();
-
-    [GeneratedRegex("\\x1B(?:[@-Z\\\\-_]|\\[[0-?]*[ -/]*[@-~])")]
-    private static partial Regex AnsiEscapeRegex();
 
     [DllImport("libc", EntryPoint = "geteuid")]
     private static extern uint GetEffectiveUserId();

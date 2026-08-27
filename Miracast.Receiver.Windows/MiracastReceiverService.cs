@@ -14,6 +14,7 @@ public sealed class MiracastReceiverService : IMiracastReceiverService, IAsyncDi
     public event EventHandler<ConnectionCreatedEventArgs>? ConnectionCreated;
     public event EventHandler<ConnectionClosedEventArgs>? ConnectionClosed;
     public event EventHandler<VideoReceivedEventArgs>? VideoReceived;
+    public event EventHandler<string>? LogReceived;
 
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
@@ -53,6 +54,7 @@ public sealed class MiracastReceiverService : IMiracastReceiverService, IAsyncDi
 
             _receiver = receiver;
             _session = session;
+            LogReceived?.Invoke(this, "Windows Miracast receiver is waiting for a source.");
         }
         finally
         {

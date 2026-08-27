@@ -11,6 +11,10 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Miracast.Receiver.Linux", "
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Miracast.Avalonia", "Miracast.Avalonia\Miracast.Avalonia.csproj", "{8521D6BA-B439-4FD1-A357-D9611F0673E0}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Miracast.Worker", "Miracast.Worker\Miracast.Worker.csproj", "{4F637C0D-254E-404A-8E25-A308230DF518}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Miracast.Receiver.Linux.Tests", "Miracast.Receiver.Linux.Tests\Miracast.Receiver.Linux.Tests.csproj", "{B16F47B5-5AB2-4FBC-AFE1-E846086114A2}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -36,5 +40,13 @@ Global
 		{8521D6BA-B439-4FD1-A357-D9611F0673E0}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{8521D6BA-B439-4FD1-A357-D9611F0673E0}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{8521D6BA-B439-4FD1-A357-D9611F0673E0}.Release|Any CPU.Build.0 = Release|Any CPU
+		{4F637C0D-254E-404A-8E25-A308230DF518}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{4F637C0D-254E-404A-8E25-A308230DF518}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{4F637C0D-254E-404A-8E25-A308230DF518}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{4F637C0D-254E-404A-8E25-A308230DF518}.Release|Any CPU.Build.0 = Release|Any CPU
+		{B16F47B5-5AB2-4FBC-AFE1-E846086114A2}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B16F47B5-5AB2-4FBC-AFE1-E846086114A2}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B16F47B5-5AB2-4FBC-AFE1-E846086114A2}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B16F47B5-5AB2-4FBC-AFE1-E846086114A2}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

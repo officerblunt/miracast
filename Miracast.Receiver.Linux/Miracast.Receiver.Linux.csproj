@@ -12,6 +12,7 @@
 
   <ItemGroup>
     <PackageReference Include="LibVLCSharp" Version="3.9.4" />
+    <PackageReference Include="Tmds.DBus" Version="0.95.0" />
   </ItemGroup>
 
 </Project>
