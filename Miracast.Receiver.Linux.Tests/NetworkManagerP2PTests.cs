@@ -31,4 +31,12 @@ public sealed class NetworkManagerP2PTests
         Assert.Null(NetworkManagerP2P.GetGroupAddress(properties, "IpAddr"));
     }
 
+    [Theory]
+    [InlineData("255.255.255.0", 24)]
+    [InlineData("255.255.0.0", 16)]
+    [InlineData("255.0.255.0", null)]
+    public void GetPrefixLength_ValidatesNetmask(string netmask, int? expected)
+    {
+        Assert.Equal(expected, NetworkManagerP2P.GetPrefixLength(IPAddress.Parse(netmask)));
+    }
 }

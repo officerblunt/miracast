@@ -41,6 +41,8 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private Task? _findRestart;
     private Task? _groupStartup;
     private CancellationTokenSource? _groupLifetime;
+    private Task? _addressConfiguration;
+    private CancellationTokenSource? _addressConfigurationLifetime;
     private Task? _groupFormationWatchdog;
     private CancellationTokenSource? _groupFormationLifetime;
     private bool _finding;
@@ -60,6 +62,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private DateTime _authorizationExpiresAt;
     private string? _authorizedPeerAddress;
     private WifiP2PPeer? _authorizedPeer;
+    private IPAddress? _negotiatedSourceAddress;
     private bool _disposed;
 
     public event EventHandler<P2PConnectionContext>? PeerConnected;
@@ -273,6 +276,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         }
         catch
         {
+            CancelAddressConfiguration();
             if (_activeConnection is { } active && _networkManager is not null)
             {
                 try { await _networkManager.DeactivateConnectionAsync(active).ConfigureAwait(false); }
@@ -301,6 +305,14 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     {
         _shouldFind = false;
         _lifetime?.Cancel();
+        CancelAddressConfiguration();
+        var addressConfiguration = _addressConfiguration;
+        if (addressConfiguration is not null)
+        {
+            try { await addressConfiguration.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+            _addressConfiguration = null;
+        }
         _groupFormationLifetime?.Cancel();
         var groupFormationWatchdog = _groupFormationWatchdog;
         if (groupFormationWatchdog is not null)
@@ -394,6 +406,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     {
         if (_activeConnection is { } active && _networkManager is not null)
         {
+            CancelAddressConfiguration();
             _activeStateSubscription?.Dispose();
             _activeStateSubscription = null;
             try
@@ -449,7 +462,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         var properties = await ip4Config.GetAllAsync().WaitAsync(cancellationToken).ConfigureAwait(false);
         var localAddress = GetLocalAddress(properties)
             ?? throw new InvalidOperationException("NetworkManager did not provide the receiver IPv4 address.");
-        var sourceAddress = GetIpAddress(properties, "Gateway")
+        var sourceAddress = GetIpAddress(properties, "Gateway") ?? _negotiatedSourceAddress
             ?? throw new InvalidOperationException("NetworkManager did not provide the Miracast Source IPv4 address.");
         var controlPort = GetWfdControlPort(peer.WfdIEs);
 
@@ -833,7 +846,21 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         // NetworkManager owns groups created through AddAndActivateConnection2 and
         // applies their IP configuration before the device reaches Activated.
         if (_networkManagerActivationPending || _activeConnection is not null)
+        {
+            var activationLifetime = _lifetime;
+            if (activationLifetime is not null
+                && !activationLifetime.IsCancellationRequested
+                && _addressConfiguration is not { IsCompleted: false })
+            {
+                _addressConfigurationLifetime?.Dispose();
+                _addressConfigurationLifetime = CancellationTokenSource.CreateLinkedTokenSource(
+                    activationLifetime.Token);
+                _addressConfiguration = ApplyNegotiatedGroupAddressAsync(
+                    properties,
+                    _addressConfigurationLifetime.Token);
+            }
             return;
+        }
 
         var lifetime = _lifetime;
         if (lifetime is null || lifetime.IsCancellationRequested || _groupStartup is { IsCompleted: false })
@@ -846,6 +873,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private void OnGroupFinished(IDictionary<string, object> properties)
     {
         CancelGroupFormationWatchdog();
+        CancelAddressConfiguration();
         _groupLifetime?.Cancel();
         _groupP2PDevice = null;
         ResetPendingAuthorization();
@@ -937,6 +965,70 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         _authorizationExpiresAt = DateTime.MinValue;
         _authorizedPeerAddress = null;
         _authorizedPeer = null;
+        _negotiatedSourceAddress = null;
+    }
+
+    private void CancelAddressConfiguration()
+    {
+        _addressConfigurationLifetime?.Cancel();
+        _addressConfigurationLifetime?.Dispose();
+        _addressConfigurationLifetime = null;
+    }
+
+    private async Task ApplyNegotiatedGroupAddressAsync(
+        IDictionary<string, object> properties,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var localAddress = GetGroupAddress(properties, "IpAddr");
+            var netmask = GetGroupAddress(properties, "IpAddrMask");
+            var sourceAddress = GetGroupAddress(properties, "IpAddrGo");
+            var prefixLength = netmask is null ? null : GetPrefixLength(netmask);
+            if (localAddress is null || sourceAddress is null || prefixLength is null)
+            {
+                Report(
+                    "wpa_supplicant did not provide a complete IPv4 configuration for the P2P group; "
+                    + "NetworkManager will continue its normal IP configuration.");
+                return;
+            }
+
+            var device = _bus.CreateProxy<INetworkManagerDevice>(Service, _devicePath);
+            var applied = await device.GetAppliedConnectionAsync(0)
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
+            applied.connection["ipv4"] = new Dictionary<string, object>
+            {
+                ["method"] = "manual",
+                ["address-data"] = new IDictionary<string, object>[]
+                {
+                    new Dictionary<string, object>
+                    {
+                        ["address"] = localAddress.ToString(),
+                        ["prefix"] = (uint)prefixLength.Value,
+                    },
+                },
+                ["never-default"] = true,
+                ["may-fail"] = false,
+            };
+            applied.connection["ipv6"] = new Dictionary<string, object>
+            {
+                ["method"] = "disabled",
+            };
+
+            _negotiatedSourceAddress = sourceAddress;
+            await device.ReapplyAsync(applied.connection, applied.versionId, 0)
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
+            Report(
+                $"Applied the negotiated P2P IPv4 configuration through NetworkManager: "
+                + $"{localAddress}/{prefixLength} → {sourceAddress}.");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            Report($"Could not apply the negotiated P2P IPv4 configuration: {exception.Message}");
+        }
     }
 
     private async Task CompleteGroupStartupAsync(
@@ -1012,6 +1104,26 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         && bytes.Any(static item => item != 0)
             ? new IPAddress(bytes)
             : null;
+
+    internal static int? GetPrefixLength(IPAddress netmask)
+    {
+        var prefixLength = 0;
+        var zeroSeen = false;
+        foreach (var value in netmask.GetAddressBytes())
+        {
+            for (var bit = 7; bit >= 0; bit--)
+            {
+                var set = (value & (1 << bit)) != 0;
+                if (set && zeroSeen)
+                    return null;
+                if (set)
+                    prefixLength++;
+                else
+                    zeroSeen = true;
+            }
+        }
+        return prefixLength;
+    }
 
     private static (string Name, IPAddress Address)? GetConfiguredInterface(IPAddress expectedAddress)
     {
@@ -1319,6 +1431,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         if (_activeConnection is null)
             return;
         _activeConnection = null;
+        CancelAddressConfiguration();
         _activeStateSubscription?.Dispose();
         _activeStateSubscription = null;
         _groupP2PDevice = null;
@@ -1392,6 +1505,12 @@ public interface INetworkManager : IDBusObject
 public interface INetworkManagerDevice : IDBusObject
 {
     Task<T> GetAsync<T>(string property);
+    Task<(IDictionary<string, IDictionary<string, object>> connection, ulong versionId)>
+        GetAppliedConnectionAsync(uint flags);
+    Task ReapplyAsync(
+        IDictionary<string, IDictionary<string, object>> connection,
+        ulong versionId,
+        uint flags);
     Task<IDisposable> WatchStateChangedAsync(Action<(uint newState, uint oldState, uint reason)> handler);
 }
 
