@@ -39,7 +39,7 @@ The host must provide:
 
 - NetworkManager 1.16 or newer with an adapter exposed as device type `wifi-p2p`;
 - `wpa_supplicant` and a Wi-Fi driver/firmware combination with Wi-Fi Direct support;
-- `gst-launch-1.0` plus GStreamer RTP, MPEG-TS, H.264, audio and video conversion plugins (normally the base/good/bad/libav plugin sets).
+- `gst-launch-1.0` plus GStreamer RTP, MPEG-TS, H.264, audio and video conversion plugins (normally the base/good/bad/libav plugin sets, plus the ugly plugin set for Miracast LPCM audio).
 
 The .NET side uses `Tmds.DBus` and talks to `org.freedesktop.NetworkManager` plus the global `fi.w1.wpa_supplicant1.WFDIEs` property on the system bus. It does not invoke `nmcli`, `systemctl`, MiracleCast, LibVLC, `sudo`, `su`, `pkexec`, or a shell. The desktop user must be permitted by the distribution's D-Bus policy to access `fi.w1.wpa_supplicant1` (Debian-family systems normally grant this to the `netdev` group).
 
@@ -51,6 +51,6 @@ After P2P activation the application reads the local address and Source address 
 
 Before answering the WFD capability request, an even UDP RTP/RTCP pair is reserved starting at `19000`. The volatile NetworkManager P2P profile is placed in the `trusted` firewall zone because the Source initiates the RTP/RTCP UDP flow; this trust applies only to the temporary direct link and the profile disappears after deactivation. The receiver advertises H.264 at 720p30/1080p30, LPCM 48 kHz stereo, UDP transport, and no HDCP or UIBC. After the Source selects a format, GStreamer takes ownership of the reserved port, binds specifically to the negotiated P2P IPv4 address, and must confirm its UDP bind before the Sink sends `SETUP` and `PLAY`.
 
-The RTP MPEG-TS stream is passed through a 100 ms jitter buffer, demultiplexed into H.264 and audio, decoded by GStreamer, and copied as synchronized BGRA frames to the Avalonia `WriteableBitmap`. Bounded leaky queues discard stale media. An RTP watchdog requests a new IDR frame after four seconds without video and tears the session down after twelve seconds. HDCP, UIBC, TCP interleaving, PIN WPS and vendor-specific protocol extensions are not implemented.
+The RTP MPEG-TS stream is passed through a 100 ms jitter buffer, demultiplexed into H.264 and audio, decoded by GStreamer, and copied as synchronized BGRA frames to the Avalonia `WriteableBitmap`. Bounded leaky queues discard stale media. Miracast LPCM is decoded by GStreamer's `dvdlpcmdec`; when that optional element is unavailable, the receiver discards only the audio track and continues rendering video. An RTP watchdog requests a new IDR frame after four seconds without video and tears the session down after twelve seconds. HDCP, UIBC, TCP interleaving, PIN WPS and vendor-specific protocol extensions are not implemented.
 
 When the window closes, the application sends a best-effort RTSP `TEARDOWN`, stops GStreamer, calls `DeactivateConnection()` and `StopFind()`, and closes the RTSP client. Wi-Fi Direct/Miracast support remains highly dependent on the concrete adapter, kernel driver and firmware, so it must be validated on the target Linux hardware.

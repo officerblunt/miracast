@@ -73,6 +73,12 @@ internal sealed class WfdSession : IAsyncDisposable
             _ports = null;
             await _renderer.PlayAsync(source, token).ConfigureAwait(false);
             _rendererStarted = true;
+            if (_renderer is VideoRenderer { AudioPlaybackEnabled: false })
+            {
+                _report(
+                    "GStreamer LPCM decoder is unavailable; continuing with video only. "
+                    + "Install the GStreamer ugly plugins to enable Miracast audio.");
+            }
 
             var setup = await _rtsp.SendRequestAsync(
                 "SETUP",

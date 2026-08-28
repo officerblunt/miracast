@@ -16,6 +16,7 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
     private int _framePending;
     private long _lastFrameUnixTimeMilliseconds;
     private string? _lastGStreamerError;
+    private bool _audioPlaybackEnabled;
     private bool _disposed;
 
     public event EventHandler<VideoFrameReceivedEventArgs>? FrameReceived;
@@ -42,7 +43,12 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
             await StopCoreAsync().ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
 
-            var process = new Process { StartInfo = CreateGStreamerStartInfo(linuxSource) };
+            _audioPlaybackEnabled = await HasGStreamerElementAsync("dvdlpcmdec", cancellationToken)
+                .ConfigureAwait(false);
+            var process = new Process
+            {
+                StartInfo = CreateGStreamerStartInfo(linuxSource, _audioPlaybackEnabled),
+            };
             try
             {
                 if (!process.Start())
@@ -92,7 +98,9 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
         }
     }
 
-    private static ProcessStartInfo CreateGStreamerStartInfo(VideoSource source)
+    internal bool AudioPlaybackEnabled => _audioPlaybackEnabled;
+
+    internal static ProcessStartInfo CreateGStreamerStartInfo(VideoSource source, bool decodeAudio)
     {
         var info = new ProcessStartInfo("gst-launch-1.0")
         {
@@ -102,7 +110,7 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
             CreateNoWindow = true,
         };
 
-        string[] arguments =
+        List<string> arguments =
         [
             "-q",
             "udpsrc", $"address={source.StreamUri.Host}", $"port={source.StreamUri.Port}",
@@ -115,13 +123,65 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
             "!", "videoconvert", "!", "videoscale",
             "!", $"video/x-raw,format=BGRA,width={source.Width},height={source.Height}",
             "!", "fdsink", "fd=1", "sync=true",
-            "demux.", "!", "queue", "max-size-buffers=12", "max-size-bytes=0", "max-size-time=0", "leaky=downstream",
-            "!", "decodebin", "!", "audioconvert", "!", "audioresample",
-            "!", "autoaudiosink", "sync=true",
         ];
+        arguments.AddRange(
+        [
+            "demux.", "!", "queue", "max-size-buffers=12", "max-size-bytes=0",
+            "max-size-time=0", "leaky=downstream",
+            "!", "audio/x-private2-lpcm",
+        ]);
+        if (decodeAudio)
+        {
+            arguments.AddRange(
+            [
+                "!", "dvdlpcmdec", "!", "audioconvert", "!", "audioresample",
+                "!", "autoaudiosink", "sync=true",
+            ]);
+        }
+        else
+        {
+            // LPCM support is optional at runtime. An unhandled audio pad makes
+            // decodebin terminate the whole pipeline, including valid H.264.
+            arguments.AddRange(["!", "fakesink", "sync=false"]);
+        }
         foreach (var argument in arguments)
             info.ArgumentList.Add(argument);
         return info;
+    }
+
+    private static async Task<bool> HasGStreamerElementAsync(
+        string element,
+        CancellationToken cancellationToken)
+    {
+        using var process = new Process
+        {
+            StartInfo = new ProcessStartInfo("gst-inspect-1.0")
+            {
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+                ArgumentList = { "--exists", element },
+            },
+        };
+        try
+        {
+            if (!process.Start())
+                return false;
+            await process.WaitForExitAsync(cancellationToken)
+                .WaitAsync(TimeSpan.FromSeconds(3), cancellationToken).ConfigureAwait(false);
+            return process.ExitCode == 0;
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            return false;
+        }
+        catch (TimeoutException)
+        {
+            try { process.Kill(entireProcessTree: true); }
+            catch (InvalidOperationException) { }
+            return false;
+        }
     }
 
     private static async Task WaitForUdpReceiverAsync(
@@ -274,6 +334,7 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
         _framePump = null;
         _errorPump = null;
         _lastGStreamerError = null;
+        _audioPlaybackEnabled = false;
         Interlocked.Exchange(ref _lastFrameUnixTimeMilliseconds, 0);
     }
 
