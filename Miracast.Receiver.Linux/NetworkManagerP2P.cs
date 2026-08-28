@@ -56,8 +56,11 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private string? _previousP2PDeviceName;
     private byte[]? _previousPrimaryDeviceType;
     private uint? _previousGoIntent;
+    private uint? _previousOperRegClass;
+    private uint? _previousOperChannel;
     private string? _previousWpsConfigMethods;
     private bool _p2pDeviceConfigured;
+    private bool _operatingChannelConfigured;
     private bool _wpsConfigured;
     private bool _incomingRequestSubscriptionsConfigured;
     private bool _connecting;
@@ -229,7 +232,8 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             _authorizedPeerAddress = normalizedAddress;
             _authorizedPeer = peer;
             _authorizationExpiresAt = DateTime.MaxValue;
-            await StopFindAsync(disable: true).ConfigureAwait(false);
+            await StopFindAsync(disable: true, attemptToken).ConfigureAwait(false);
+            await ConfigureConcurrentWifiChannelAsync(attemptToken).ConfigureAwait(false);
             Report(
                 $"Connection attempt #{attemptId} from {peer.Name} started with a "
                 + $"{ConnectionAttemptTimeout.TotalSeconds:0}-second deadline. "
@@ -309,25 +313,36 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             var timedOut = exception is OperationCanceledException
                 && attemptLifetime.IsCancellationRequested
                 && !cancellationToken.IsCancellationRequested;
+            var receiverToken = _lifetime?.Token ?? cancellationToken;
+            using var recoveryLifetime = CancellationTokenSource.CreateLinkedTokenSource(receiverToken);
+            recoveryLifetime.CancelAfter(TimeSpan.FromSeconds(2));
+            var recoveryToken = recoveryLifetime.Token;
             CancelAddressConfiguration();
             if (_activeConnection is { } active && _networkManager is not null)
             {
-                try { await _networkManager.DeactivateConnectionAsync(active).ConfigureAwait(false); }
+                try
+                {
+                    await _networkManager.DeactivateConnectionAsync(active)
+                        .WaitAsync(recoveryToken).ConfigureAwait(false);
+                }
                 catch { }
                 _activeConnection = null;
             }
             DisposeActivationBus();
             Volatile.Write(ref _currentAttemptId, 0);
             if (_supplicantP2PDevice is { } p2pDevice)
-                await ResetStaleP2PStateAsync(p2pDevice).ConfigureAwait(false);
+            {
+                await ResetStaleP2PStateAsync(
+                    p2pDevice,
+                    recoveryToken).ConfigureAwait(false);
+            }
             _activeStateSubscription?.Dispose();
             _activeStateSubscription = null;
             _currentGroupObjectPath = null;
             ResetPendingAuthorization();
-            var recoveryToken = _lifetime?.Token ?? CancellationToken.None;
-            if (!recoveryToken.IsCancellationRequested)
+            if (!receiverToken.IsCancellationRequested)
             {
-                try { await StartDiscoveryAsync(recoveryToken).ConfigureAwait(false); }
+                try { await StartDiscoveryAsync(receiverToken).ConfigureAwait(false); }
                 catch { }
             }
             if (timedOut)
@@ -369,6 +384,8 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         _lifetime?.Cancel();
         _connectionAttemptLifetime?.Cancel();
         DisposeActivationBus();
+        using var cleanupLifetime = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        var cleanupToken = cleanupLifetime.Token;
         var authorization = _authorizationOperations.Current;
         if (authorization is not null)
         {
@@ -386,7 +403,11 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         }
         if (_activeConnection is { } active && _networkManager is not null)
         {
-            try { await _networkManager.DeactivateConnectionAsync(active).ConfigureAwait(false); }
+            try
+            {
+                await _networkManager.DeactivateConnectionAsync(active)
+                    .WaitAsync(cleanupToken).ConfigureAwait(false);
+            }
             catch (Exception exception) { Report($"Could not deactivate the P2P connection: {exception.Message}"); }
             _activeConnection = null;
         }
@@ -397,7 +418,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         Volatile.Write(ref _currentAttemptId, 0);
         _currentGroupObjectPath = null;
         _groupP2PDevice = null;
-        await ReleaseSupplicantP2PStateAsync().ConfigureAwait(false);
+        await ReleaseSupplicantP2PStateAsync(cleanupToken).ConfigureAwait(false);
 
         foreach (var subscription in _subscriptions)
             subscription.Dispose();
@@ -418,7 +439,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         _lifetime = null;
         _peersByAddress.Clear();
         _peerAddressesByPath.Clear();
-        await RestoreWfdAdvertisementAsync().ConfigureAwait(false);
+        await RestoreWfdAdvertisementAsync(cleanupToken).ConfigureAwait(false);
         _initialP2PResetCompleted = false;
         _authorizationExpiresAt = DateTime.MinValue;
         _authorizedPeerAddress = null;
@@ -429,14 +450,17 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         IWpaP2PDevice p2pDevice,
         CancellationToken cancellationToken = default)
     {
-        try { await p2pDevice.CancelAsync().ConfigureAwait(false); }
-        catch (Exception) { }
-        try { await p2pDevice.DisconnectAsync().ConfigureAwait(false); }
-        catch (Exception) { }
-        try { await p2pDevice.StopFindAsync().ConfigureAwait(false); }
-        catch (Exception) { }
-        try { await p2pDevice.FlushAsync().ConfigureAwait(false); }
-        catch (Exception) { }
+        if (!await TryP2POperationAsync(p2pDevice.CancelAsync, cancellationToken).ConfigureAwait(false))
+            return;
+        if (await HasP2PGroupAsync(p2pDevice, cancellationToken).ConfigureAwait(false))
+        {
+            if (!await TryP2POperationAsync(p2pDevice.DisconnectAsync, cancellationToken).ConfigureAwait(false))
+                return;
+        }
+        if (!await TryP2POperationAsync(p2pDevice.StopFindAsync, cancellationToken).ConfigureAwait(false))
+            return;
+        if (!await TryP2POperationAsync(p2pDevice.FlushAsync, cancellationToken).ConfigureAwait(false))
+            return;
 
         try
         {
@@ -447,19 +471,62 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         }
     }
 
-    private async Task ReleaseSupplicantP2PStateAsync()
+    private static async Task<bool> HasP2PGroupAsync(
+        IWpaP2PDevice p2pDevice,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var group = await p2pDevice.GetAsync<ObjectPath>("Group")
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
+            if (group.ToString() != "/")
+                return true;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return false;
+        }
+        catch (Exception)
+        {
+        }
+
+        return GetP2PGroupInterfaceNames().Length > 0;
+    }
+
+    private static async Task<bool> TryP2POperationAsync(
+        Func<Task> operation,
+        CancellationToken cancellationToken)
+    {
+        if (cancellationToken.IsCancellationRequested)
+            return false;
+        try
+        {
+            await operation().WaitAsync(cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return false;
+        }
+        catch (Exception)
+        {
+            return true;
+        }
+    }
+
+    private async Task ReleaseSupplicantP2PStateAsync(CancellationToken cancellationToken)
     {
         if (_groupP2PDevice is not null)
         {
-            try { await _groupP2PDevice.DisconnectAsync().ConfigureAwait(false); }
-            catch (Exception exception) { Report($"Could not disconnect the P2P group: {exception.Message}"); }
+            await TryP2POperationAsync(_groupP2PDevice.DisconnectAsync, cancellationToken)
+                .ConfigureAwait(false);
             _groupP2PDevice = null;
         }
 
         var p2pDevice = _supplicantP2PDevice;
         if (p2pDevice is null)
             return;
-        await ResetStaleP2PStateAsync(p2pDevice).ConfigureAwait(false);
+        await ResetStaleP2PStateAsync(p2pDevice, cancellationToken).ConfigureAwait(false);
         _finding = false;
     }
 
@@ -509,7 +576,11 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             _groupP2PDevice = null;
         }
         if (_supplicantP2PDevice is { } supplicantP2PDevice)
-            await ResetStaleP2PStateAsync(supplicantP2PDevice).ConfigureAwait(false);
+        {
+            await ResetStaleP2PStateAsync(
+                supplicantP2PDevice,
+                _lifetime?.Token ?? CancellationToken.None).ConfigureAwait(false);
+        }
         DisposeActivationBus();
         Volatile.Write(ref _currentAttemptId, 0);
         _currentGroupObjectPath = null;
@@ -677,13 +748,13 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                 try
                 {
                     if (_finding)
-                        await StopFindAsync(disable: false).ConfigureAwait(false);
+                        await StopFindAsync(disable: false, cancellationToken).ConfigureAwait(false);
                     await ConfigureWfdAdvertisementAsync(cancellationToken).ConfigureAwait(false);
                     var p2pDevice = _supplicantP2PDevice
                         ?? throw new InvalidOperationException("The wpa_supplicant P2PDevice proxy is not available.");
                     if (!_initialP2PResetCompleted)
                     {
-                        await ResetStaleP2PStateAsync(p2pDevice).ConfigureAwait(false);
+                        await ResetStaleP2PStateAsync(p2pDevice, cancellationToken).ConfigureAwait(false);
                         _initialP2PResetCompleted = true;
                     }
                     await WaitForPendingScanAsync(cancellationToken).ConfigureAwait(false);
@@ -717,9 +788,9 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                             + "Cleaning the P2P operation and retrying without restarting NetworkManager…");
                         busyReported = true;
                     }
-                    var p2pDevice = _supplicantP2PDevice;
-                    if (p2pDevice is not null)
-                        await ResetStaleP2PStateAsync(p2pDevice).ConfigureAwait(false);
+                    // Do not enqueue Cancel/Disconnect/StopFind/Flush while the
+                    // physical adapter is scanning. Some drivers serialize those
+                    // calls and execute the accumulated queue after scan completion.
                     await Task.Delay(TimeSpan.FromSeconds(3), cancellationToken).ConfigureAwait(false);
                 }
             }
@@ -832,6 +903,16 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                         _previousPrimaryDeviceType = primaryType;
                     if (existing.TryGetValue("GOIntent", out var intent) && intent is uint goIntent)
                         _previousGoIntent = goIntent;
+                    if (existing.TryGetValue("OperRegClass", out var regClass)
+                        && regClass is uint operatingRegClass)
+                    {
+                        _previousOperRegClass = operatingRegClass;
+                    }
+                    if (existing.TryGetValue("OperChannel", out var channel)
+                        && channel is uint operatingChannel)
+                    {
+                        _previousOperChannel = operatingChannel;
+                    }
                     break;
                 }
                 catch (DBusException exception) when (IsMissingP2PInterface(exception))
@@ -930,6 +1011,139 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                 .WaitAsync(cancellationToken).ConfigureAwait(false));
             _incomingRequestSubscriptionsConfigured = true;
         }
+    }
+
+    private async Task ConfigureConcurrentWifiChannelAsync(CancellationToken cancellationToken)
+    {
+        var frequency = await GetConcurrentWifiFrequencyAsync(cancellationToken).ConfigureAwait(false);
+        if (frequency is null)
+            return;
+        if (!TryGetP2POperatingChannel(frequency.Value, out var regClass, out var channel))
+        {
+            Report(
+                $"Regular Wi-Fi is using unsupported P2P frequency {frequency.Value} MHz; "
+                + "P2P channel selection will remain automatic.");
+            return;
+        }
+
+        var p2pDevice = _supplicantP2PDevice
+            ?? throw new InvalidOperationException("The wpa_supplicant P2P interface is unavailable.");
+        await p2pDevice.SetAsync("P2PDeviceConfig", new Dictionary<string, object>
+        {
+            ["OperRegClass"] = regClass,
+            ["OperChannel"] = channel,
+        }).WaitAsync(cancellationToken).ConfigureAwait(false);
+        _operatingChannelConfigured = true;
+        Report(
+            $"Pinned Wi-Fi Direct to the active Wi-Fi channel {channel} "
+            + $"({frequency.Value} MHz, operating class {regClass}) to preserve connectivity.");
+    }
+
+    private async Task<int?> GetConcurrentWifiFrequencyAsync(CancellationToken cancellationToken)
+    {
+        if (_networkManager is null)
+            return null;
+
+        try
+        {
+            var p2pInterface = await _bus.CreateProxy<INetworkManagerDevice>(Service, _devicePath)
+                .GetAsync<string>("Interface").WaitAsync(cancellationToken).ConfigureAwait(false);
+            var devices = await _networkManager.GetDevicesAsync()
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
+            var activeRadios = new List<(string Interface, int? Frequency)>();
+            foreach (var path in devices)
+            {
+                var device = _bus.CreateProxy<INetworkManagerDevice>(Service, path);
+                if (await device.GetAsync<uint>("DeviceType").WaitAsync(cancellationToken)
+                        .ConfigureAwait(false) != 2
+                    || await device.GetAsync<uint>("State").WaitAsync(cancellationToken)
+                        .ConfigureAwait(false) != DeviceStateActivated)
+                {
+                    continue;
+                }
+
+                var interfaceName = await device.GetAsync<string>("Interface")
+                    .WaitAsync(cancellationToken).ConfigureAwait(false);
+                int? frequency = null;
+                var wirelessDevice = _bus.CreateProxy<INetworkManagerWirelessDevice>(Service, path);
+                var accessPointPath = await wirelessDevice.GetAsync<ObjectPath>("ActiveAccessPoint")
+                    .WaitAsync(cancellationToken).ConfigureAwait(false);
+                if (accessPointPath.ToString() != "/")
+                {
+                    var accessPoint = _bus.CreateProxy<INetworkManagerAccessPoint>(Service, accessPointPath);
+                    var value = await accessPoint.GetAsync<uint>("Frequency")
+                        .WaitAsync(cancellationToken).ConfigureAwait(false);
+                    if (value is > 0 and <= int.MaxValue)
+                        frequency = (int)value;
+                }
+                activeRadios.Add((interfaceName, frequency));
+            }
+
+            if (activeRadios.Count == 0)
+                return null;
+
+            var selected = activeRadios.FirstOrDefault(item =>
+                IsSameRadioInterface(p2pInterface, item.Interface));
+            if (selected == default && activeRadios.Count == 1)
+                selected = activeRadios[0];
+
+            var descriptions = string.Join(", ", activeRadios.Select(item =>
+                item.Frequency is null
+                    ? item.Interface
+                    : $"{item.Interface} at {item.Frequency} MHz"));
+            if (selected.Frequency is not null)
+            {
+                Report(
+                    $"{descriptions} is connected to regular Wi-Fi. Keeping it managed and connected; "
+                    + $"requesting same-channel P2P at {selected.Frequency} MHz.");
+                return selected.Frequency;
+            }
+
+            Report(
+                $"Warning: {descriptions} is connected to regular Wi-Fi, but its channel could not be read. "
+                + "P2P will use automatic channel selection.");
+            return null;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            Report(
+                $"Could not read the regular Wi-Fi channel from NetworkManager: {exception.Message}. "
+                + "P2P will use automatic channel selection.");
+            return null;
+        }
+    }
+
+    internal static bool IsSameRadioInterface(string p2pInterface, string wifiInterface) =>
+        p2pInterface.Equals(wifiInterface, StringComparison.Ordinal)
+        || p2pInterface.Equals($"p2p-dev-{wifiInterface}", StringComparison.Ordinal)
+        || p2pInterface.StartsWith($"p2p-{wifiInterface}-", StringComparison.Ordinal);
+
+    internal static bool TryGetP2POperatingChannel(
+        int frequency,
+        out uint operatingClass,
+        out uint channel)
+    {
+        (operatingClass, channel) = frequency switch
+        {
+            2484 => (82u, 14u),
+            >= 2412 and <= 2472 when (frequency - 2407) % 5 == 0 =>
+                (81u, (uint)((frequency - 2407) / 5)),
+            >= 5180 and <= 5240 when (frequency - 5000) % 5 == 0 =>
+                (115u, (uint)((frequency - 5000) / 5)),
+            >= 5260 and <= 5320 when (frequency - 5000) % 5 == 0 =>
+                (118u, (uint)((frequency - 5000) / 5)),
+            >= 5500 and <= 5720 when (frequency - 5000) % 5 == 0 =>
+                (121u, (uint)((frequency - 5000) / 5)),
+            >= 5745 and <= 5805 when (frequency - 5000) % 5 == 0 =>
+                (124u, (uint)((frequency - 5000) / 5)),
+            5825 => (125u, 165u),
+            _ => (0u, 0u),
+        };
+        return operatingClass != 0;
     }
 
     private void OnFindStopped()
@@ -1274,7 +1488,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         }
     }
 
-    private async Task RestoreWfdAdvertisementAsync()
+    private async Task RestoreWfdAdvertisementAsync(CancellationToken cancellationToken)
     {
         try
         {
@@ -1287,18 +1501,24 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                     previousConfig["PrimaryDeviceType"] = _previousPrimaryDeviceType;
                 if (_previousGoIntent is not null)
                     previousConfig["GOIntent"] = _previousGoIntent.Value;
+                if (_operatingChannelConfigured)
+                {
+                    previousConfig["OperRegClass"] = _previousOperRegClass ?? 0u;
+                    previousConfig["OperChannel"] = _previousOperChannel ?? 0u;
+                }
                 if (previousConfig.Count > 0)
-                    await _supplicantP2PDevice.SetAsync("P2PDeviceConfig", previousConfig).ConfigureAwait(false);
+                    await _supplicantP2PDevice.SetAsync("P2PDeviceConfig", previousConfig)
+                        .WaitAsync(cancellationToken).ConfigureAwait(false);
             }
             if (_wpsConfigured && _supplicantWps is not null && _previousWpsConfigMethods is not null)
             {
                 await _supplicantWps.SetAsync("ConfigMethods", _previousWpsConfigMethods)
-                    .ConfigureAwait(false);
+                    .WaitAsync(cancellationToken).ConfigureAwait(false);
             }
             if (_wfdAdvertisementConfigured && _supplicant is not null)
             {
                 await _supplicant.SetAsync("WFDIEs", _previousWfdInformationElements ?? [])
-                    .ConfigureAwait(false);
+                    .WaitAsync(cancellationToken).ConfigureAwait(false);
             }
         }
         catch (Exception exception)
@@ -1310,6 +1530,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             _wfdAdvertisementConfigured = false;
             _previousWfdInformationElements = null;
             _p2pDeviceConfigured = false;
+            _operatingChannelConfigured = false;
             _wpsConfigured = false;
             _incomingRequestSubscriptionsConfigured = false;
             _supplicantP2PDevice = null;
@@ -1318,6 +1539,8 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             _previousP2PDeviceName = null;
             _previousPrimaryDeviceType = null;
             _previousGoIntent = null;
+            _previousOperRegClass = null;
+            _previousOperChannel = null;
             _previousWpsConfigMethods = null;
         }
     }
@@ -1457,13 +1680,20 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         catch (Exception exception) { Report($"Could not restart P2P discovery: {exception.Message}"); }
     }
 
-    private async Task StopFindAsync(bool disable)
+    private async Task StopFindAsync(
+        bool disable,
+        CancellationToken cancellationToken = default)
     {
         if (disable)
             _shouldFind = false;
         if (_supplicantP2PDevice is not null)
         {
-            try { await _supplicantP2PDevice.StopFindAsync().ConfigureAwait(false); }
+            try
+            {
+                await _supplicantP2PDevice.StopFindAsync()
+                    .WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
             catch (DBusException) { }
             catch (Exception exception) { Report($"Could not stop P2P listen: {exception.Message}"); }
         }
@@ -1527,6 +1757,18 @@ public interface INetworkManagerDevice : IDBusObject
         ulong versionId,
         uint flags);
     Task<IDisposable> WatchStateChangedAsync(Action<(uint newState, uint oldState, uint reason)> handler);
+}
+
+[DBusInterface("org.freedesktop.NetworkManager.Device.Wireless")]
+public interface INetworkManagerWirelessDevice : IDBusObject
+{
+    Task<T> GetAsync<T>(string property);
+}
+
+[DBusInterface("org.freedesktop.NetworkManager.AccessPoint")]
+public interface INetworkManagerAccessPoint : IDBusObject
+{
+    Task<T> GetAsync<T>(string property);
 }
 
 [DBusInterface("org.freedesktop.NetworkManager.Device.WifiP2P")]

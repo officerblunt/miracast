@@ -18,5 +18,6 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Miracast.Receiver.Linux\Miracast.Receiver.Linux.csproj" />
+    <ProjectReference Include="..\Miracast.Worker\Miracast.Worker.csproj" />
   </ItemGroup>
 </Project>

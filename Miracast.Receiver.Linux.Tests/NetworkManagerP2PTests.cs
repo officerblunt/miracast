@@ -49,4 +49,53 @@ public sealed class NetworkManagerP2PTests
     {
         Assert.Equal(expected, NetworkManagerP2P.GetPrefixLength(IPAddress.Parse(netmask)));
     }
+
+    [Theory]
+    [InlineData("p2p-dev-wlan0", "wlan0", true)]
+    [InlineData("p2p-wlan0-0", "wlan0", true)]
+    [InlineData("wlan0", "wlan0", true)]
+    [InlineData("p2p-dev-wlan1", "wlan0", false)]
+    public void MatchesP2PDeviceToItsPhysicalWifiInterface(
+        string p2pInterface,
+        string wifiInterface,
+        bool expected)
+    {
+        Assert.Equal(expected, NetworkManagerP2P.IsSameRadioInterface(p2pInterface, wifiInterface));
+    }
+
+    [Theory]
+    [InlineData(2412, 81, 1)]
+    [InlineData(2437, 81, 6)]
+    [InlineData(2484, 82, 14)]
+    [InlineData(5180, 115, 36)]
+    [InlineData(5220, 115, 44)]
+    [InlineData(5500, 121, 100)]
+    [InlineData(5745, 124, 149)]
+    [InlineData(5825, 125, 165)]
+    public void ConvertsWifiFrequencyToP2POperatingChannel(
+        int frequency,
+        uint expectedClass,
+        uint expectedChannel)
+    {
+        var converted = NetworkManagerP2P.TryGetP2POperatingChannel(
+            frequency,
+            out var operatingClass,
+            out var channel);
+
+        Assert.True(converted);
+        Assert.Equal(expectedClass, operatingClass);
+        Assert.Equal(expectedChannel, channel);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(2400)]
+    [InlineData(5955)]
+    public void RejectsUnsupportedP2POperatingFrequency(int frequency)
+    {
+        Assert.False(NetworkManagerP2P.TryGetP2POperatingChannel(
+            frequency,
+            out _,
+            out _));
+    }
 }
