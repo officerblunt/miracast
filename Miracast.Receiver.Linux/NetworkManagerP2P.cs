@@ -232,6 +232,10 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                     ["type"] = "wifi-p2p",
                     ["uuid"] = Guid.NewGuid().ToString(),
                     ["autoconnect"] = false,
+                    // The Source initiates the RTP/RTCP UDP flow. Keeping the
+                    // volatile P2P link in the firewall's default zone can let
+                    // outbound RTSP through while silently dropping all media.
+                    ["zone"] = "trusted",
                 },
                 ["wifi-p2p"] = new Dictionary<string, object>
                 {

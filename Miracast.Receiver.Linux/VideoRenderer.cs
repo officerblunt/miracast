@@ -15,6 +15,7 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
     private Task? _errorPump;
     private int _framePending;
     private long _lastFrameUnixTimeMilliseconds;
+    private string? _lastGStreamerError;
     private bool _disposed;
 
     public event EventHandler<VideoFrameReceivedEventArgs>? FrameReceived;
@@ -57,6 +58,7 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
 
             _gstreamer = process;
             Interlocked.Exchange(ref _lastFrameUnixTimeMilliseconds, 0);
+            _lastGStreamerError = null;
             _playback = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             _framePump = PumpFramesAsync(process, linuxSource, _playback.Token);
             _errorPump = DrainErrorsAsync(process, _playback.Token);
@@ -103,7 +105,7 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
         string[] arguments =
         [
             "-q",
-            "udpsrc", $"port={source.StreamUri.Port}",
+            "udpsrc", $"address={source.StreamUri.Host}", $"port={source.StreamUri.Port}",
             "caps=application/x-rtp,media=video,clock-rate=90000,encoding-name=MP2T,payload=33",
             "!", "rtpjitterbuffer", "latency=100", "drop-on-latency=true", "do-lost=true",
             "!", "rtpmp2tdepay",
@@ -213,18 +215,31 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
         }
     }
 
-    private static async Task DrainErrorsAsync(Process process, CancellationToken cancellationToken)
+    private async Task DrainErrorsAsync(Process process, CancellationToken cancellationToken)
     {
         try
         {
-            while (await process.StandardError.ReadLineAsync(cancellationToken).ConfigureAwait(false) is not null)
+            while (await process.StandardError.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
             {
-                // Draining stderr prevents a full pipe from stalling gst-launch.
+                if (!string.IsNullOrWhiteSpace(line))
+                    _lastGStreamerError = line.Trim();
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
         }
+    }
+
+    internal string? DescribeNoFrames()
+    {
+        var process = _gstreamer;
+        if (process is null)
+            return "GStreamer is not running.";
+        if (process.HasExited)
+            return $"GStreamer exited with code {process.ExitCode}: {_lastGStreamerError ?? "no diagnostic output"}.";
+        if (_lastGStreamerError is not null)
+            return $"Last GStreamer diagnostic: {_lastGStreamerError}";
+        return $"GStreamer is listening on {process.StartInfo.ArgumentList.FirstOrDefault(argument => argument.StartsWith("address=", StringComparison.Ordinal))?.Split('=', 2)[1] ?? "the P2P address"}.";
     }
 
     private async Task StopCoreAsync()
@@ -258,6 +273,7 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
         _playback = null;
         _framePump = null;
         _errorPump = null;
+        _lastGStreamerError = null;
         Interlocked.Exchange(ref _lastFrameUnixTimeMilliseconds, 0);
     }
 

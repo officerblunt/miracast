@@ -34,6 +34,7 @@ public sealed class WfdSessionTests
         Assert.True(renderer.WasPrepared);
         Assert.Equal(1920, source.Width);
         Assert.Equal(1080, source.Height);
+        Assert.Equal(IPAddress.Loopback.ToString(), source.StreamUri.Host);
         Assert.Equal(negotiatedRtpPort, source.StreamUri.Port);
         Assert.True(renderer.WasStopped);
         listener.Stop();

@@ -64,7 +64,7 @@ internal sealed class WfdSession : IAsyncDisposable
             await _setupTriggered.Task.WaitAsync(TimeSpan.FromSeconds(30), token).ConfigureAwait(false);
             _ports ??= RtpPortReservation.Reserve();
             var source = new VideoSource(
-                new Uri($"rtp://@0.0.0.0:{_ports.RtpPort}"),
+                new Uri($"rtp://{_connection.LocalAddress}:{_ports.RtpPort}"),
                 _width,
                 _height);
 
@@ -84,6 +84,8 @@ internal sealed class WfdSession : IAsyncDisposable
                 cancellationToken: token).ConfigureAwait(false);
             setup.EnsureSuccess();
             _sessionId = ReadSessionId(setup);
+            if (setup.Headers.TryGetValue("Transport", out var negotiatedTransport))
+                _report($"WFD SETUP transport: {negotiatedTransport}.");
 
             var play = await _rtsp.SendRequestAsync(
                 "PLAY",
@@ -273,7 +275,10 @@ internal sealed class WfdSession : IAsyncDisposable
                         TimeSpan.FromSeconds(2),
                         cancellationToken: cancellationToken).ConfigureAwait(false);
                     response.EnsureSuccess();
-                    _report("No video frames received; requested a new IDR frame.");
+                    var rendererDiagnostic = (_renderer as VideoRenderer)?.DescribeNoFrames();
+                    _report(
+                        "No decoded video frames received; requested a new IDR frame."
+                        + (rendererDiagnostic is null ? string.Empty : $" {rendererDiagnostic}"));
                 }
                 catch (Exception exception) when (exception is not OperationCanceledException)
                 {
@@ -282,7 +287,12 @@ internal sealed class WfdSession : IAsyncDisposable
             }
 
             if (silence >= TimeSpan.FromSeconds(12))
-                throw new TimeoutException("No RTP video frames were received for 12 seconds.");
+            {
+                var rendererDiagnostic = (_renderer as VideoRenderer)?.DescribeNoFrames();
+                throw new TimeoutException(
+                    "No decoded RTP video frames were received for 12 seconds."
+                    + (rendererDiagnostic is null ? string.Empty : $" {rendererDiagnostic}"));
+            }
         }
     }
 
