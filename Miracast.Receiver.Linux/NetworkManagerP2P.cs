@@ -289,6 +289,8 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                 catch { }
                 _activeConnection = null;
             }
+            if (_supplicantP2PDevice is { } p2pDevice)
+                await ResetStaleP2PStateAsync(p2pDevice, cancellationToken).ConfigureAwait(false);
             _activeStateSubscription?.Dispose();
             _activeStateSubscription = null;
             ResetPendingAuthorization();
@@ -378,14 +380,26 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         _authorizedPeer = null;
     }
 
-    private async Task ResetStaleP2PStateAsync(IWpaP2PDevice p2pDevice)
+    private async Task ResetStaleP2PStateAsync(
+        IWpaP2PDevice p2pDevice,
+        CancellationToken cancellationToken = default)
     {
         try { await p2pDevice.CancelAsync().ConfigureAwait(false); }
+        catch (Exception) { }
+        try { await p2pDevice.DisconnectAsync().ConfigureAwait(false); }
         catch (Exception) { }
         try { await p2pDevice.StopFindAsync().ConfigureAwait(false); }
         catch (Exception) { }
         try { await p2pDevice.FlushAsync().ConfigureAwait(false); }
         catch (Exception) { }
+
+        try
+        {
+            await WaitForP2PGroupInterfacesToDisappearAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
     }
 
     private async Task ReleaseSupplicantP2PStateAsync()
@@ -400,12 +414,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         var p2pDevice = _supplicantP2PDevice;
         if (p2pDevice is null)
             return;
-        try { await p2pDevice.CancelAsync().ConfigureAwait(false); }
-        catch (Exception exception) { Report($"Could not cancel the pending P2P operation: {exception.Message}"); }
-        try { await p2pDevice.StopFindAsync().ConfigureAwait(false); }
-        catch (Exception exception) { Report($"Could not stop P2P discovery: {exception.Message}"); }
-        try { await p2pDevice.FlushAsync().ConfigureAwait(false); }
-        catch (Exception exception) { Report($"Could not flush stale P2P peers: {exception.Message}"); }
+        await ResetStaleP2PStateAsync(p2pDevice).ConfigureAwait(false);
         _finding = false;
     }
 
@@ -426,6 +435,12 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             }
             _activeConnection = null;
             _groupP2PDevice = null;
+            if (_supplicantP2PDevice is { } p2pDevice)
+            {
+                await ResetStaleP2PStateAsync(
+                    p2pDevice,
+                    _lifetime?.Token ?? CancellationToken.None).ConfigureAwait(false);
+            }
             ResetPendingAuthorization();
             PeerDisconnected?.Invoke(this, EventArgs.Empty);
             var cancellationToken = _lifetime?.Token ?? CancellationToken.None;
@@ -444,14 +459,43 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             catch (Exception exception) { Report($"Could not disconnect the P2P group: {exception.Message}"); }
             _groupP2PDevice = null;
         }
-        if (_supplicantP2PDevice is not null)
-        {
-            try { await _supplicantP2PDevice.CancelAsync().ConfigureAwait(false); }
-            catch (Exception) { }
-        }
+        if (_supplicantP2PDevice is { } supplicantP2PDevice)
+            await ResetStaleP2PStateAsync(supplicantP2PDevice).ConfigureAwait(false);
         ResetPendingAuthorization();
         QueueDiscoveryRestart("the Miracast session ended");
     }
+
+    private async Task WaitForP2PGroupInterfacesToDisappearAsync(CancellationToken cancellationToken)
+    {
+        var staleInterfaces = GetP2PGroupInterfaceNames();
+        if (staleInterfaces.Length == 0)
+            return;
+
+        Report($"Waiting for stale Wi-Fi Direct group interface(s) to disappear: {string.Join(", ", staleInterfaces)}…");
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+            staleInterfaces = GetP2PGroupInterfaceNames();
+            if (staleInterfaces.Length == 0)
+                return;
+        }
+
+        Report(
+            $"The Wi-Fi driver retained stale P2P group interface(s): {string.Join(", ", staleInterfaces)}. "
+            + "A new group may fail until the driver releases them.");
+    }
+
+    internal static string[] GetP2PGroupInterfaceNames() =>
+        NetworkInterface.GetAllNetworkInterfaces()
+            .Select(networkInterface => networkInterface.Name)
+            .Where(IsP2PGroupInterfaceName)
+            .Order(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+    internal static bool IsP2PGroupInterfaceName(string name) =>
+        name.StartsWith("p2p-", StringComparison.OrdinalIgnoreCase)
+        && !name.StartsWith("p2p-dev-", StringComparison.OrdinalIgnoreCase);
 
     private async Task<P2PConnectionContext> CreateConnectionContextAsync(
         INetworkManagerDevice device,

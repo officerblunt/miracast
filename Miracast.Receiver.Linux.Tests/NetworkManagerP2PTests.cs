@@ -5,6 +5,16 @@ namespace Miracast.Receiver.Linux.Tests;
 
 public sealed class NetworkManagerP2PTests
 {
+    [Theory]
+    [InlineData("p2p-0", true)]
+    [InlineData("p2p-wlan0-1", true)]
+    [InlineData("p2p-dev-wlan0", false)]
+    [InlineData("wlan0", false)]
+    public void IdentifiesOnlyP2PGroupInterfaces(string name, bool expected)
+    {
+        Assert.Equal(expected, NetworkManagerP2P.IsP2PGroupInterfaceName(name));
+    }
+
     [Fact]
     public void GetGroupAddress_ParsesAddressReportedBySupplicant()
     {
