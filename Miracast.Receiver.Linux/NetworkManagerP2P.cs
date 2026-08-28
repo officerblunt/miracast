@@ -192,15 +192,21 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             var supplicantPeerPath = await FindSupplicantPeerPathAsync(peer, cancellationToken)
                 .ConfigureAwait(false);
 
-            await ReportConcurrentWifiConnectionsAsync(cancellationToken).ConfigureAwait(false);
-            await p2pDevice.ConnectAsync(new Dictionary<string, object>
+            var preferredFrequency = await GetConcurrentWifiFrequencyAsync(cancellationToken)
+                .ConfigureAwait(false);
+            var connectOptions = new Dictionary<string, object>
             {
                 ["peer"] = supplicantPeerPath,
                 ["persistent"] = false,
                 ["authorize_only"] = true,
                 ["go_intent"] = 0,
                 ["wps_method"] = "pbc",
-            }).WaitAsync(cancellationToken).ConfigureAwait(false);
+            };
+            if (preferredFrequency is not null)
+                connectOptions["frequency"] = preferredFrequency.Value;
+
+            await p2pDevice.ConnectAsync(connectOptions)
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
             _authorizedPeerAddress = normalizedAddress;
             _authorizedPeer = peer;
             _authorizationExpiresAt = DateTime.UtcNow + TimeSpan.FromSeconds(60);
@@ -950,35 +956,87 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         }
     }
 
-    private async Task ReportConcurrentWifiConnectionsAsync(CancellationToken cancellationToken)
+    private async Task<int?> GetConcurrentWifiFrequencyAsync(CancellationToken cancellationToken)
     {
         if (_networkManager is null)
-            return;
+            return null;
 
-        var devices = await _networkManager.GetDevicesAsync()
-            .WaitAsync(cancellationToken).ConfigureAwait(false);
-        var activeInterfaces = new List<string>();
-        foreach (var path in devices)
+        try
         {
-            var device = _bus.CreateProxy<INetworkManagerDevice>(Service, path);
-            if (await device.GetAsync<uint>("DeviceType").WaitAsync(cancellationToken).ConfigureAwait(false) != 2
-                || await device.GetAsync<uint>("State").WaitAsync(cancellationToken).ConfigureAwait(false)
-                    != DeviceStateActivated)
+            var p2pInterface = await _bus.CreateProxy<INetworkManagerDevice>(Service, _devicePath)
+                .GetAsync<string>("Interface").WaitAsync(cancellationToken).ConfigureAwait(false);
+            var devices = await _networkManager.GetDevicesAsync()
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
+            var activeRadios = new List<(string Interface, int? Frequency)>();
+            foreach (var path in devices)
             {
-                continue;
+                var device = _bus.CreateProxy<INetworkManagerDevice>(Service, path);
+                if (await device.GetAsync<uint>("DeviceType").WaitAsync(cancellationToken).ConfigureAwait(false) != 2
+                    || await device.GetAsync<uint>("State").WaitAsync(cancellationToken).ConfigureAwait(false)
+                        != DeviceStateActivated)
+                {
+                    continue;
+                }
+
+                var interfaceName = await device.GetAsync<string>("Interface")
+                    .WaitAsync(cancellationToken).ConfigureAwait(false);
+                int? frequency = null;
+                var wirelessDevice = _bus.CreateProxy<INetworkManagerWirelessDevice>(Service, path);
+                var accessPointPath = await wirelessDevice.GetAsync<ObjectPath>("ActiveAccessPoint")
+                    .WaitAsync(cancellationToken).ConfigureAwait(false);
+                if (accessPointPath.ToString() != "/")
+                {
+                    var accessPoint = _bus.CreateProxy<INetworkManagerAccessPoint>(Service, accessPointPath);
+                    var value = await accessPoint.GetAsync<uint>("Frequency")
+                        .WaitAsync(cancellationToken).ConfigureAwait(false);
+                    if (value is > 0 and <= int.MaxValue)
+                        frequency = (int)value;
+                }
+                activeRadios.Add((interfaceName, frequency));
             }
 
-            activeInterfaces.Add(
-                await device.GetAsync<string>("Interface").WaitAsync(cancellationToken).ConfigureAwait(false));
-        }
+            if (activeRadios.Count == 0)
+                return null;
 
-        if (activeInterfaces.Count > 0)
+            var selected = activeRadios.FirstOrDefault(item =>
+                IsSameRadioInterface(p2pInterface, item.Interface));
+            if (selected == default && activeRadios.Count == 1)
+                selected = activeRadios[0];
+
+            var descriptions = string.Join(", ", activeRadios.Select(item =>
+                item.Frequency is null
+                    ? item.Interface
+                    : $"{item.Interface} at {item.Frequency} MHz"));
+            if (selected.Frequency is not null)
+            {
+                Report(
+                    $"{descriptions} is connected to regular Wi-Fi. Keeping it managed and connected; "
+                    + $"requesting same-channel P2P at {selected.Frequency} MHz.");
+                return selected.Frequency;
+            }
+
+            Report(
+                $"Warning: {descriptions} is connected to regular Wi-Fi, but its channel could not be read. "
+                + "P2P will use automatic channel selection.");
+            return null;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
         {
             Report(
-                $"Warning: {string.Join(", ", activeInterfaces)} is connected to regular Wi-Fi. "
-                + "If P2P times out, disconnect that Wi-Fi connection and retry over Ethernet.");
+                $"Could not read the regular Wi-Fi channel from NetworkManager: {exception.Message}. "
+                + "P2P will use automatic channel selection.");
+            return null;
         }
     }
+
+    internal static bool IsSameRadioInterface(string p2pInterface, string wifiInterface) =>
+        p2pInterface.Equals(wifiInterface, StringComparison.Ordinal)
+        || p2pInterface.Equals($"p2p-dev-{wifiInterface}", StringComparison.Ordinal)
+        || p2pInterface.StartsWith($"p2p-{wifiInterface}-", StringComparison.Ordinal);
 
     private async Task VerifyWfdAdvertisementAsync(CancellationToken cancellationToken)
     {
@@ -1330,6 +1388,18 @@ public interface INetworkManagerDevice : IDBusObject
 {
     Task<T> GetAsync<T>(string property);
     Task<IDisposable> WatchStateChangedAsync(Action<(uint newState, uint oldState, uint reason)> handler);
+}
+
+[DBusInterface("org.freedesktop.NetworkManager.Device.Wireless")]
+public interface INetworkManagerWirelessDevice : IDBusObject
+{
+    Task<T> GetAsync<T>(string property);
+}
+
+[DBusInterface("org.freedesktop.NetworkManager.AccessPoint")]
+public interface INetworkManagerAccessPoint : IDBusObject
+{
+    Task<T> GetAsync<T>(string property);
 }
 
 [DBusInterface("org.freedesktop.NetworkManager.Device.WifiP2P")]
