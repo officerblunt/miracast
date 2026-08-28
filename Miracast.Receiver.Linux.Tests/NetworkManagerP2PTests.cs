@@ -31,16 +31,4 @@ public sealed class NetworkManagerP2PTests
         Assert.Null(NetworkManagerP2P.GetGroupAddress(properties, "IpAddr"));
     }
 
-    [Theory]
-    [InlineData("p2p-dev-wlan0", "wlan0", true)]
-    [InlineData("p2p-wlan0-0", "wlan0", true)]
-    [InlineData("wlan0", "wlan0", true)]
-    [InlineData("p2p-dev-wlan1", "wlan0", false)]
-    public void IsSameRadioInterface_MatchesP2PInterfaceNames(
-        string p2pInterface,
-        string wifiInterface,
-        bool expected)
-    {
-        Assert.Equal(expected, NetworkManagerP2P.IsSameRadioInterface(p2pInterface, wifiInterface));
-    }
 }
