@@ -45,6 +45,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private CancellationTokenSource? _addressConfigurationLifetime;
     private Task? _groupFormationWatchdog;
     private CancellationTokenSource? _groupFormationLifetime;
+    private TaskCompletionSource? _pendingActivation;
     private bool _finding;
     private bool _shouldFind;
     private bool _wfdAdvertisementConfigured;
@@ -208,6 +209,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
 
             var device = _bus.CreateProxy<INetworkManagerDevice>(Service, _devicePath);
             var activated = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _pendingActivation = activated;
             _activeStateSubscription?.Dispose();
             _activeStateSubscription = await device.WatchStateChangedAsync(change =>
             {
@@ -299,6 +301,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         }
         finally
         {
+            _pendingActivation = null;
             _networkManagerActivationPending = false;
             _connecting = false;
             _authorizationGate.Release();
@@ -897,16 +900,29 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private void OnGONegotiationFailure(IDictionary<string, object> properties)
     {
         CancelGroupFormationWatchdog();
+        var details = FormatProperties(properties);
+        Report($"Wi-Fi Direct GO negotiation failed: {details}");
+        if (_networkManagerActivationPending)
+        {
+            _pendingActivation?.TrySetException(new InvalidOperationException(
+                $"wpa_supplicant rejected Wi-Fi Direct GO negotiation: {details}"));
+            return;
+        }
         ResetPendingAuthorization();
-        Report($"Wi-Fi Direct GO negotiation failed: {FormatProperties(properties)}");
         QueueDiscoveryRestart("GO negotiation failed");
     }
 
     private void OnGroupFormationFailure(string reason)
     {
         CancelGroupFormationWatchdog();
-        ResetPendingAuthorization();
         Report($"Wi-Fi Direct group formation failed: {reason}");
+        if (_networkManagerActivationPending)
+        {
+            _pendingActivation?.TrySetException(new InvalidOperationException(
+                $"wpa_supplicant could not form the Wi-Fi Direct group: {reason}"));
+            return;
+        }
+        ResetPendingAuthorization();
         QueueDiscoveryRestart("group formation failed");
     }
 
