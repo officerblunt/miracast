@@ -10,7 +10,9 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private const string Service = "org.freedesktop.NetworkManager";
     private const string SupplicantService = "fi.w1.wpa_supplicant1";
     private const string SupplicantPath = "/fi/w1/wpa_supplicant1";
+    private const uint WifiDeviceType = 2;
     private const uint WifiP2PDeviceType = 30;
+    private const uint DeviceStateDisconnected = 30;
     private const uint DeviceStateActivated = 100;
     private const uint DeviceStateFailed = 120;
     private static readonly TimeSpan ConnectionAttemptTimeout = TimeSpan.FromSeconds(60);
@@ -38,6 +40,8 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private IWifiP2PDevice? _p2pDevice;
     private IDisposable? _activeStateSubscription;
     private ObjectPath _devicePath;
+    private string? _p2pInterfaceName;
+    private string? _parentWifiInterfaceName;
     private ObjectPath? _activeConnection;
     private CancellationTokenSource? _lifetime;
     private Task? _findRenewal;
@@ -58,6 +62,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private uint? _previousGoIntent;
     private uint? _previousOperRegClass;
     private uint? _previousOperChannel;
+    private bool? _previousNoGroupIface;
     private string? _previousWpsConfigMethods;
     private bool _p2pDeviceConfigured;
     private bool _operatingChannelConfigured;
@@ -88,16 +93,63 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         _supplicant = _bus.CreateProxy<IWpaSupplicant>(SupplicantService, SupplicantPath);
 
         var devices = await _networkManager.GetDevicesAsync().WaitAsync(cancellationToken).ConfigureAwait(false);
+        var wifiStates = new Dictionary<string, uint>(StringComparer.Ordinal);
         foreach (var path in devices)
         {
             var device = _bus.CreateProxy<INetworkManagerDevice>(Service, path);
             var deviceType = await device.GetAsync<uint>("DeviceType")
                 .WaitAsync(cancellationToken).ConfigureAwait(false);
-            if (deviceType != WifiP2PDeviceType || _p2pDevice is not null)
+            if (deviceType != WifiDeviceType)
                 continue;
 
-            _devicePath = path;
-            _p2pDevice = _bus.CreateProxy<IWifiP2PDevice>(Service, path);
+            var interfaceName = await device.GetAsync<string>("Interface")
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
+            var state = await device.GetAsync<uint>("State")
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
+            wifiStates[interfaceName] = state;
+        }
+
+        var candidates = new List<P2PDeviceCandidate>();
+        foreach (var path in devices)
+        {
+            var device = _bus.CreateProxy<INetworkManagerDevice>(Service, path);
+            var deviceType = await device.GetAsync<uint>("DeviceType")
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
+            if (deviceType != WifiP2PDeviceType)
+                continue;
+
+            var interfaceName = await device.GetAsync<string>("Interface")
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
+            var deviceState = await device.GetAsync<uint>("State")
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
+            var parentInterface = GetParentWifiInterfaceName(interfaceName);
+            uint? parentState = parentInterface is not null
+                && wifiStates.TryGetValue(parentInterface, out var knownParentState)
+                    ? knownParentState
+                    : null;
+            candidates.Add(new P2PDeviceCandidate(
+                path,
+                interfaceName,
+                parentInterface,
+                deviceState,
+                parentState));
+        }
+
+        var selected = SelectP2PDeviceCandidate(candidates);
+        if (selected is not null)
+        {
+            _devicePath = selected.Path;
+            _p2pInterfaceName = selected.InterfaceName;
+            _parentWifiInterfaceName = selected.ParentInterfaceName;
+            _p2pDevice = _bus.CreateProxy<IWifiP2PDevice>(Service, selected.Path);
+
+            if (selected.ParentState == DeviceStateDisconnected
+                && wifiStates.Values.Any(static state => state == DeviceStateActivated))
+            {
+                Report(
+                    $"Using idle Wi-Fi adapter {selected.ParentInterfaceName} for Wi-Fi Direct "
+                    + "so the active regular Wi-Fi adapter remains untouched.");
+            }
         }
 
         if (_p2pDevice is null)
@@ -260,26 +312,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                     _ = HandleDisconnectedAsync(attemptId, _lifetime?.Token ?? CancellationToken.None);
             }).WaitAsync(attemptToken).ConfigureAwait(false);
 
-            var connection = new Dictionary<string, IDictionary<string, object>>
-            {
-                ["connection"] = new Dictionary<string, object>
-                {
-                    ["id"] = $"Miracast {peer.Name}",
-                    ["type"] = "wifi-p2p",
-                    ["uuid"] = Guid.NewGuid().ToString(),
-                    ["autoconnect"] = false,
-                    // The Source initiates the RTP/RTCP UDP flow. Keeping the
-                    // volatile P2P link in the firewall's default zone can let
-                    // outbound RTSP through while silently dropping all media.
-                    ["zone"] = "trusted",
-                },
-                ["wifi-p2p"] = new Dictionary<string, object>
-                {
-                    ["peer"] = peer.HardwareAddress,
-                    ["wfd-ies"] = SinkWfdInformationElements,
-                    ["wps-method"] = 0x4u,
-                },
-            };
+            var connection = CreateP2PConnectionSettings(peer.Name, peer.HardwareAddress);
             var options = new Dictionary<string, object>
             {
                 ["persist"] = "volatile",
@@ -299,7 +332,9 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             var result = await activationRequest.WaitAsync(attemptToken).ConfigureAwait(false);
 
             _activeConnection = result.activeConnection;
-            Report("NetworkManager accepted the P2P activation. Completing WPS pairing…");
+            Report(
+                "NetworkManager accepted the route-isolated P2P activation. "
+                + "Completing WPS pairing…");
             var state = await device.GetAsync<uint>("State").WaitAsync(attemptToken).ConfigureAwait(false);
             if (state == DeviceStateActivated)
                 activated.TrySetResult();
@@ -371,6 +406,59 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         try { await activation.ConfigureAwait(false); }
         catch { }
     }
+
+    internal static Dictionary<string, IDictionary<string, object>> CreateP2PConnectionSettings(
+        string peerName,
+        string peerHardwareAddress) =>
+        new()
+        {
+            ["connection"] = new Dictionary<string, object>
+            {
+                ["id"] = $"Miracast {peerName}",
+                ["type"] = "wifi-p2p",
+                ["uuid"] = Guid.NewGuid().ToString(),
+                ["autoconnect"] = false,
+                // The Source initiates the RTP/RTCP UDP flow. Keeping the
+                // volatile P2P link in the firewall's default zone can let
+                // outbound RTSP through while silently dropping all media.
+                ["zone"] = "trusted",
+            },
+            ["wifi-p2p"] = new Dictionary<string, object>
+            {
+                ["peer"] = peerHardwareAddress,
+                ["wfd-ies"] = SinkWfdInformationElements,
+                ["wps-method"] = 0x4u,
+            },
+            // These settings must be present before activation. Applying them
+            // only after GroupStarted leaves a window where NetworkManager may
+            // install the P2P gateway and DNS as the machine-wide defaults.
+            ["ipv4"] = new Dictionary<string, object>
+            {
+                ["method"] = "auto",
+                ["never-default"] = true,
+                ["ignore-auto-dns"] = true,
+                ["may-fail"] = false,
+            },
+            ["ipv6"] = new Dictionary<string, object>
+            {
+                ["method"] = "auto",
+                ["never-default"] = true,
+                ["ignore-auto-dns"] = true,
+                ["may-fail"] = true,
+            },
+        };
+
+    internal static Dictionary<string, object> CreateP2PDeviceConfiguration(string receiverName) =>
+        new()
+        {
+            ["DeviceName"] = receiverName,
+            ["PrimaryDeviceType"] = DisplayPrimaryDeviceType,
+            ["GOIntent"] = 0u,
+            // A dedicated group interface is required for STA + P2P
+            // concurrency. Reusing the managed STA interface disconnects the
+            // regular Wi-Fi connection as soon as the group is formed.
+            ["NoGroupIface"] = false,
+        };
 
     private void DisposeActivationBus()
     {
@@ -444,6 +532,9 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         _authorizationExpiresAt = DateTime.MinValue;
         _authorizedPeerAddress = null;
         _authorizedPeer = null;
+        _p2pDevice = null;
+        _p2pInterfaceName = null;
+        _parentWifiInterfaceName = null;
     }
 
     private async Task ResetStaleP2PStateAsync(
@@ -889,13 +980,19 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                 .WaitAsync(cancellationToken).ConfigureAwait(false);
             foreach (var path in interfaces)
             {
-                var candidate = _bus.CreateProxy<IWpaP2PDevice>(SupplicantService, path);
+                var interfaceProxy = _bus.CreateProxy<IWpaInterface>(SupplicantService, path);
                 try
                 {
+                    var interfaceName = await interfaceProxy.GetAsync<string>("Ifname")
+                        .WaitAsync(cancellationToken).ConfigureAwait(false);
+                    if (!IsSupplicantInterfaceForP2PDevice(interfaceName, _p2pInterfaceName))
+                        continue;
+
+                    var candidate = _bus.CreateProxy<IWpaP2PDevice>(SupplicantService, path);
                     var existing = await candidate.GetAsync<IDictionary<string, object>>("P2PDeviceConfig")
                         .WaitAsync(cancellationToken).ConfigureAwait(false);
                     _supplicantP2PDevice = candidate;
-                    _supplicantInterface = _bus.CreateProxy<IWpaInterface>(SupplicantService, path);
+                    _supplicantInterface = interfaceProxy;
                     _supplicantWps = _bus.CreateProxy<IWpaWps>(SupplicantService, path);
                     if (existing.TryGetValue("DeviceName", out var name) && name is string deviceName)
                         _previousP2PDeviceName = deviceName;
@@ -913,6 +1010,11 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                     {
                         _previousOperChannel = operatingChannel;
                     }
+                    if (existing.TryGetValue("NoGroupIface", out var noGroupInterface)
+                        && noGroupInterface is bool noGroupIface)
+                    {
+                        _previousNoGroupIface = noGroupIface;
+                    }
                     break;
                 }
                 catch (DBusException exception) when (IsMissingP2PInterface(exception))
@@ -923,16 +1025,15 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
 
         var p2pDevice = _supplicantP2PDevice
             ?? throw new InvalidOperationException(
-                "wpa_supplicant did not expose a P2PDevice interface for the Wi-Fi adapter.");
+                $"wpa_supplicant did not expose a P2PDevice interface for Wi-Fi adapter "
+                + $"'{_parentWifiInterfaceName ?? _p2pInterfaceName ?? "unknown"}'.");
         var receiverName = $"Miracast Receiver ({Environment.MachineName})";
         if (receiverName.Length > 32)
             receiverName = receiverName[..32];
-        await p2pDevice.SetAsync("P2PDeviceConfig", new Dictionary<string, object>
-        {
-            ["DeviceName"] = receiverName,
-            ["PrimaryDeviceType"] = DisplayPrimaryDeviceType,
-            ["GOIntent"] = 0u,
-        }).WaitAsync(cancellationToken).ConfigureAwait(false);
+        await p2pDevice.SetAsync(
+                "P2PDeviceConfig",
+                CreateP2PDeviceConfiguration(receiverName))
+            .WaitAsync(cancellationToken).ConfigureAwait(false);
         _p2pDeviceConfigured = true;
 
         var wps = _supplicantWps
@@ -1046,8 +1147,16 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
 
         try
         {
-            var p2pInterface = await _bus.CreateProxy<INetworkManagerDevice>(Service, _devicePath)
-                .GetAsync<string>("Interface").WaitAsync(cancellationToken).ConfigureAwait(false);
+            var parentInterface = _parentWifiInterfaceName;
+            if (parentInterface is null)
+            {
+                Report(
+                    $"Could not identify the physical Wi-Fi interface behind "
+                    + $"'{_p2pInterfaceName ?? "the selected P2P device"}'. "
+                    + "P2P channel selection will remain automatic.");
+                return null;
+            }
+
             var devices = await _networkManager.GetDevicesAsync()
                 .WaitAsync(cancellationToken).ConfigureAwait(false);
             var activeRadios = new List<(string Interface, int? Frequency)>();
@@ -1055,7 +1164,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             {
                 var device = _bus.CreateProxy<INetworkManagerDevice>(Service, path);
                 if (await device.GetAsync<uint>("DeviceType").WaitAsync(cancellationToken)
-                        .ConfigureAwait(false) != 2
+                        .ConfigureAwait(false) != WifiDeviceType
                     || await device.GetAsync<uint>("State").WaitAsync(cancellationToken)
                         .ConfigureAwait(false) != DeviceStateActivated)
                 {
@@ -1083,9 +1192,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                 return null;
 
             var selected = activeRadios.FirstOrDefault(item =>
-                IsSameRadioInterface(p2pInterface, item.Interface));
-            if (selected == default && activeRadios.Count == 1)
-                selected = activeRadios[0];
+                item.Interface.Equals(parentInterface, StringComparison.Ordinal));
 
             var descriptions = string.Join(", ", activeRadios.Select(item =>
                 item.Frequency is null
@@ -1099,8 +1206,16 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                 return selected.Frequency;
             }
 
+            if (selected == default)
+            {
+                Report(
+                    $"Regular Wi-Fi is active on {descriptions}, while Wi-Fi Direct uses the separate "
+                    + $"adapter {parentInterface}. Leaving the P2P channel automatic.");
+                return null;
+            }
+
             Report(
-                $"Warning: {descriptions} is connected to regular Wi-Fi, but its channel could not be read. "
+                $"Warning: {parentInterface} is connected to regular Wi-Fi, but its channel could not be read. "
                 + "P2P will use automatic channel selection.");
             return null;
         }
@@ -1116,6 +1231,33 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             return null;
         }
     }
+
+    internal static string? GetParentWifiInterfaceName(string p2pInterface) =>
+        p2pInterface.StartsWith("p2p-dev-", StringComparison.Ordinal)
+            ? p2pInterface["p2p-dev-".Length..]
+            : null;
+
+    internal static bool IsSupplicantInterfaceForP2PDevice(
+        string supplicantInterface,
+        string? p2pInterface) =>
+        p2pInterface is not null
+        && GetParentWifiInterfaceName(p2pInterface) is { } parentInterface
+        && supplicantInterface.Equals(parentInterface, StringComparison.Ordinal);
+
+    internal static P2PDeviceCandidate? SelectP2PDeviceCandidate(
+        IEnumerable<P2PDeviceCandidate> candidates) =>
+        candidates
+            .Where(static candidate => candidate.DeviceState is DeviceStateDisconnected or DeviceStateActivated)
+            .OrderBy(static candidate => candidate.DeviceState == DeviceStateDisconnected ? 0 : 1)
+            .ThenBy(static candidate => candidate.ParentInterfaceName is null
+                || candidate.ParentState is null
+                ? 3
+                : candidate.ParentState == DeviceStateDisconnected
+                    ? 0
+                    : candidate.ParentState == DeviceStateActivated
+                        ? 1
+                        : 2)
+            .FirstOrDefault();
 
     internal static bool IsSameRadioInterface(string p2pInterface, string wifiInterface) =>
         p2pInterface.Equals(wifiInterface, StringComparison.Ordinal)
@@ -1319,6 +1461,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                     },
                 },
                 ["never-default"] = true,
+                ["ignore-auto-dns"] = true,
                 ["may-fail"] = false,
             };
             applied.connection["ipv6"] = new Dictionary<string, object>
@@ -1506,6 +1649,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                     previousConfig["OperRegClass"] = _previousOperRegClass ?? 0u;
                     previousConfig["OperChannel"] = _previousOperChannel ?? 0u;
                 }
+                previousConfig["NoGroupIface"] = _previousNoGroupIface ?? false;
                 if (previousConfig.Count > 0)
                     await _supplicantP2PDevice.SetAsync("P2PDeviceConfig", previousConfig)
                         .WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -1541,6 +1685,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             _previousGoIntent = null;
             _previousOperRegClass = null;
             _previousOperChannel = null;
+            _previousNoGroupIface = null;
             _previousWpsConfigMethods = null;
         }
     }
@@ -1725,6 +1870,13 @@ internal sealed record WifiP2PPeer(
     string HardwareAddress,
     byte Strength,
     byte[] WfdIEs);
+
+internal sealed record P2PDeviceCandidate(
+    ObjectPath Path,
+    string InterfaceName,
+    string? ParentInterfaceName,
+    uint DeviceState,
+    uint? ParentState);
 
 internal sealed record P2PConnectionContext(
     WifiP2PPeer Peer,

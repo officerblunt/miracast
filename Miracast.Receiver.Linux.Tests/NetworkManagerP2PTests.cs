@@ -1,4 +1,5 @@
 using System.Net;
+using Tmds.DBus;
 using Xunit;
 
 namespace Miracast.Receiver.Linux.Tests;
@@ -97,5 +98,182 @@ public sealed class NetworkManagerP2PTests
             frequency,
             out _,
             out _));
+    }
+
+    [Fact]
+    public void P2PConnectionIsIsolatedFromDefaultRouteAndDnsBeforeActivation()
+    {
+        var settings = NetworkManagerP2P.CreateP2PConnectionSettings(
+            "Source",
+            "42:AE:30:AB:8C:A2");
+
+        var ipv4 = settings["ipv4"];
+        Assert.Equal("auto", ipv4["method"]);
+        Assert.Equal(true, ipv4["never-default"]);
+        Assert.Equal(true, ipv4["ignore-auto-dns"]);
+        Assert.Equal(false, ipv4["may-fail"]);
+
+        var ipv6 = settings["ipv6"];
+        Assert.Equal("auto", ipv6["method"]);
+        Assert.Equal(true, ipv6["never-default"]);
+        Assert.Equal(true, ipv6["ignore-auto-dns"]);
+        Assert.Equal(true, ipv6["may-fail"]);
+    }
+
+    [Fact]
+    public void P2PDeviceUsesDedicatedGroupInterface()
+    {
+        var configuration = NetworkManagerP2P.CreateP2PDeviceConfiguration("Receiver");
+
+        Assert.Equal(false, configuration["NoGroupIface"]);
+    }
+
+    [Theory]
+    [InlineData("p2p-dev-wlan0", "wlan0")]
+    [InlineData("p2p-dev-wlxb8fbb3dfa1e4", "wlxb8fbb3dfa1e4")]
+    [InlineData("p2p-wlan0-0", null)]
+    [InlineData("wlan0", null)]
+    public void ExtractsOnlyNetworkManagerP2PParentInterface(string name, string? expected)
+    {
+        Assert.Equal(expected, NetworkManagerP2P.GetParentWifiInterfaceName(name));
+    }
+
+    [Theory]
+    [InlineData("wlan0", "p2p-dev-wlan0", true)]
+    [InlineData("p2p-wlan0-0", "p2p-dev-wlan0", false)]
+    [InlineData("wlan1", "p2p-dev-wlan0", false)]
+    [InlineData("wlan0", "p2p-wlan0-0", false)]
+    public void MatchesSupplicantInterfaceToSelectedP2PDevice(
+        string supplicantInterface,
+        string p2pInterface,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            NetworkManagerP2P.IsSupplicantInterfaceForP2PDevice(
+                supplicantInterface,
+                p2pInterface));
+    }
+
+    [Fact]
+    public void PrefersIdleAdapterOverAdapterCarryingRegularWifi()
+    {
+        var candidates = new[]
+        {
+            new P2PDeviceCandidate(
+                new ObjectPath("/active"),
+                "p2p-dev-wlan0",
+                "wlan0",
+                30,
+                100),
+            new P2PDeviceCandidate(
+                new ObjectPath("/idle"),
+                "p2p-dev-wlan1",
+                "wlan1",
+                30,
+                30),
+        };
+
+        var selected = NetworkManagerP2P.SelectP2PDeviceCandidate(candidates);
+
+        Assert.NotNull(selected);
+        Assert.Equal("p2p-dev-wlan1", selected.InterfaceName);
+    }
+
+    [Theory]
+    [InlineData(40)]
+    [InlineData(70)]
+    [InlineData(110)]
+    [InlineData(120)]
+    public void DoesNotTreatTransitionalOrFailedAdapterAsIdle(uint otherState)
+    {
+        var candidates = new[]
+        {
+            new P2PDeviceCandidate(
+                new ObjectPath("/other"),
+                "p2p-dev-wlan1",
+                "wlan1",
+                30,
+                otherState),
+            new P2PDeviceCandidate(
+                new ObjectPath("/active"),
+                "p2p-dev-wlan0",
+                "wlan0",
+                30,
+                100),
+        };
+
+        var selected = NetworkManagerP2P.SelectP2PDeviceCandidate(candidates);
+
+        Assert.NotNull(selected);
+        Assert.Equal("p2p-dev-wlan0", selected.InterfaceName);
+    }
+
+    [Fact]
+    public void IgnoresUnavailableP2PDeviceEvenWhenItsParentIsIdle()
+    {
+        var candidates = new[]
+        {
+            new P2PDeviceCandidate(
+                new ObjectPath("/unavailable"),
+                "p2p-dev-wlan1",
+                "wlan1",
+                20,
+                30),
+            new P2PDeviceCandidate(
+                new ObjectPath("/active_parent"),
+                "p2p-dev-wlan0",
+                "wlan0",
+                30,
+                100),
+        };
+
+        var selected = NetworkManagerP2P.SelectP2PDeviceCandidate(candidates);
+
+        Assert.NotNull(selected);
+        Assert.Equal("p2p-dev-wlan0", selected.InterfaceName);
+    }
+
+    [Theory]
+    [InlineData(20)]
+    [InlineData(40)]
+    [InlineData(70)]
+    [InlineData(110)]
+    [InlineData(120)]
+    public void RejectsP2PDeviceThatIsUnavailableBusyOrFailed(uint state)
+    {
+        var candidate = new P2PDeviceCandidate(
+            new ObjectPath("/candidate"),
+            "p2p-dev-wlan0",
+            "wlan0",
+            state,
+            30);
+
+        Assert.Null(NetworkManagerP2P.SelectP2PDeviceCandidate(new[] { candidate }));
+    }
+
+    [Fact]
+    public void DoesNotPreferOrphanedP2PDeviceOverKnownActiveParent()
+    {
+        var candidates = new[]
+        {
+            new P2PDeviceCandidate(
+                new ObjectPath("/orphan"),
+                "p2p-dev-wlan9",
+                "wlan9",
+                30,
+                null),
+            new P2PDeviceCandidate(
+                new ObjectPath("/known"),
+                "p2p-dev-wlan0",
+                "wlan0",
+                30,
+                100),
+        };
+
+        var selected = NetworkManagerP2P.SelectP2PDeviceCandidate(candidates);
+
+        Assert.NotNull(selected);
+        Assert.Equal("p2p-dev-wlan0", selected.InterfaceName);
     }
 }
