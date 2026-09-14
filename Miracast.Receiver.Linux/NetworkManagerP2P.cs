@@ -24,6 +24,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
 
     private readonly Connection _bus = new(Address.System);
     private readonly PeerOperationCoalescer _authorizationOperations = new();
+    private readonly PeerOperationCoalescer _disconnectionOperations = new();
     private readonly SemaphoreSlim _authorizationGate = new(1, 1);
     private readonly SemaphoreSlim _discoveryGate = new(1, 1);
     private readonly List<IDisposable> _subscriptions = [];
@@ -481,6 +482,13 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             catch (OperationCanceledException) { }
             catch { }
         }
+        var disconnection = _disconnectionOperations.Current;
+        if (disconnection is not null)
+        {
+            try { await disconnection.WaitAsync(cleanupToken).ConfigureAwait(false); }
+            catch (OperationCanceledException) when (cleanupToken.IsCancellationRequested) { }
+            catch { }
+        }
         CancelAddressConfiguration();
         var addressConfiguration = _addressConfiguration;
         if (addressConfiguration is not null)
@@ -621,62 +629,77 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         _finding = false;
     }
 
-    public async Task DisconnectCurrentAsync()
+    public Task DisconnectCurrentAsync()
     {
         _connectionAttemptLifetime?.Cancel();
-        if (_activeConnection is { } active && _networkManager is not null)
+        return _disconnectionOperations.RunAsync(
+            "current-p2p-session",
+            () => DisconnectCurrentCoreAsync(expectedAttemptId: null),
+            CancellationToken.None);
+    }
+
+    private async Task DisconnectCurrentCoreAsync(long? expectedAttemptId)
+    {
+        if (expectedAttemptId is not null
+            && Volatile.Read(ref _currentAttemptId) != expectedAttemptId.Value)
         {
-            CancelAddressConfiguration();
-            _activeStateSubscription?.Dispose();
-            _activeStateSubscription = null;
+            return;
+        }
+
+        var activeConnection = _activeConnection;
+        var groupDevice = _groupP2PDevice;
+        if (activeConnection is null
+            && groupDevice is null
+            && _currentGroupObjectPath is null
+            && Volatile.Read(ref _currentAttemptId) == 0)
+        {
+            return;
+        }
+
+        CancelAddressConfiguration();
+        _activeStateSubscription?.Dispose();
+        _activeStateSubscription = null;
+        _activeConnection = null;
+        _groupP2PDevice = null;
+        DisposeActivationBus();
+        Volatile.Write(ref _currentAttemptId, 0);
+        _currentGroupObjectPath = null;
+        ResetPendingAuthorization();
+        PeerDisconnected?.Invoke(this, EventArgs.Empty);
+
+        using var deactivationLifetime = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        if (activeConnection is not null && _networkManager is not null)
+        {
             try
             {
-                await _networkManager.DeactivateConnectionAsync(active).ConfigureAwait(false);
+                await _networkManager.DeactivateConnectionAsync(activeConnection.Value)
+                    .WaitAsync(deactivationLifetime.Token).ConfigureAwait(false);
             }
             catch (Exception exception)
             {
                 Report($"Could not deactivate the P2P connection: {exception.Message}");
             }
-            _activeConnection = null;
-            DisposeActivationBus();
-            Volatile.Write(ref _currentAttemptId, 0);
-            _currentGroupObjectPath = null;
-            _groupP2PDevice = null;
-            if (_supplicantP2PDevice is { } p2pDevice)
-            {
-                await ResetStaleP2PStateAsync(
-                    p2pDevice,
-                    _lifetime?.Token ?? CancellationToken.None).ConfigureAwait(false);
-            }
-            ResetPendingAuthorization();
-            PeerDisconnected?.Invoke(this, EventArgs.Empty);
-            var cancellationToken = _lifetime?.Token ?? CancellationToken.None;
-            if (!cancellationToken.IsCancellationRequested)
-            {
-                try { await StartDiscoveryAsync(cancellationToken).ConfigureAwait(false); }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
-                catch (Exception exception) { Report($"Could not restart P2P discovery: {exception.Message}"); }
-            }
-            return;
+        }
+        using var p2pCleanupLifetime = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        var p2pCleanupToken = p2pCleanupLifetime.Token;
+        if (activeConnection is null && groupDevice is not null)
+        {
+            await TryP2POperationAsync(groupDevice.DisconnectAsync, p2pCleanupToken).ConfigureAwait(false);
         }
 
-        if (_groupP2PDevice is not null)
-        {
-            try { await _groupP2PDevice.DisconnectAsync().ConfigureAwait(false); }
-            catch (Exception exception) { Report($"Could not disconnect the P2P group: {exception.Message}"); }
-            _groupP2PDevice = null;
-        }
         if (_supplicantP2PDevice is { } supplicantP2PDevice)
         {
-            await ResetStaleP2PStateAsync(
-                supplicantP2PDevice,
-                _lifetime?.Token ?? CancellationToken.None).ConfigureAwait(false);
+            await ResetStaleP2PStateAsync(supplicantP2PDevice, p2pCleanupToken).ConfigureAwait(false);
         }
-        DisposeActivationBus();
-        Volatile.Write(ref _currentAttemptId, 0);
-        _currentGroupObjectPath = null;
-        ResetPendingAuthorization();
-        QueueDiscoveryRestart("the Miracast session ended");
+
+        var lifetime = _lifetime;
+        if (lifetime is not null && !lifetime.IsCancellationRequested)
+        {
+            // Restart outside this cleanup operation. A pending driver scan must
+            // not keep a duplicate disconnect or window shutdown waiting.
+            _shouldFind = true;
+            QueueDiscoveryRestart("the Miracast session ended");
+        }
     }
 
     private async Task WaitForP2PGroupInterfacesToDisappearAsync(CancellationToken cancellationToken)
@@ -1804,25 +1827,15 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
 
     private async Task HandleDisconnectedAsync(long attemptId, CancellationToken cancellationToken)
     {
-        if (Volatile.Read(ref _currentAttemptId) != attemptId)
-            return;
-        if (_activeConnection is null)
-            return;
-        _activeConnection = null;
-        DisposeActivationBus();
-        Volatile.Write(ref _currentAttemptId, 0);
-        _currentGroupObjectPath = null;
-        CancelAddressConfiguration();
-        _activeStateSubscription?.Dispose();
-        _activeStateSubscription = null;
-        _groupP2PDevice = null;
-        ResetPendingAuthorization();
-        PeerDisconnected?.Invoke(this, EventArgs.Empty);
-        if (_supplicantP2PDevice is { } p2pDevice)
-            await ResetStaleP2PStateAsync(p2pDevice, cancellationToken).ConfigureAwait(false);
-        try { await StartDiscoveryAsync(cancellationToken).ConfigureAwait(false); }
+        try
+        {
+            await _disconnectionOperations.RunAsync(
+                "current-p2p-session",
+                () => DisconnectCurrentCoreAsync(attemptId),
+                cancellationToken).ConfigureAwait(false);
+        }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
-        catch (Exception exception) { Report($"Could not restart P2P discovery: {exception.Message}"); }
+        catch (Exception exception) { Report($"Could not clean up the disconnected P2P session: {exception.Message}"); }
     }
 
     private async Task StopFindAsync(

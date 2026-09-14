@@ -2,12 +2,15 @@ using System.Buffers;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using Miracast.Receiver.Entities.EventArgs;
 
 namespace Miracast.Receiver.Linux;
 
 public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
 {
+    private const int SigInt = 2;
+    private const int SigTerm = 15;
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private Process? _gstreamer;
     private CancellationTokenSource? _playback;
@@ -42,6 +45,13 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
         {
             await StopCoreAsync().ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
+
+            if (!await HasGStreamerElementAsync("avdec_h264", cancellationToken).ConfigureAwait(false))
+            {
+                throw new InvalidOperationException(
+                    "The software H.264 decoder avdec_h264 is unavailable. "
+                    + "Install the GStreamer libav plugin.");
+            }
 
             _audioPlaybackEnabled = await HasGStreamerElementAsync("dvdlpcmdec", cancellationToken)
                 .ConfigureAwait(false);
@@ -112,6 +122,7 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
 
         List<string> arguments =
         [
+            "-e",
             "-q",
             "udpsrc", $"address={source.StreamUri.Host}", $"port={source.StreamUri.Port}",
             "caps=application/x-rtp,media=video,clock-rate=90000,encoding-name=MP2T,payload=33",
@@ -119,7 +130,10 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
             "!", "rtpmp2tdepay",
             "!", "tsdemux", "name=demux",
             "demux.", "!", "queue", "max-size-buffers=3", "max-size-bytes=0", "max-size-time=0", "leaky=downstream",
-            "!", "h264parse", "!", "decodebin",
+            // Keep Miracast decoding away from the desktop GPU. An auto-selected
+            // VAAPI decoder can leave the display stack wedged when a wireless
+            // source disappears while the decoder is being torn down.
+            "!", "h264parse", "!", "avdec_h264",
             "!", "videoconvert", "!", "videoscale",
             "!", $"video/x-raw,format=BGRA,width={source.Width},height={source.Height}",
             "!", "fdsink", "fd=1", "sync=true",
@@ -309,9 +323,7 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
         {
             try
             {
-                if (!_gstreamer.HasExited)
-                    _gstreamer.Kill(entireProcessTree: true);
-                await _gstreamer.WaitForExitAsync().ConfigureAwait(false);
+                await StopGStreamerProcessAsync(_gstreamer).ConfigureAwait(false);
             }
             catch (InvalidOperationException)
             {
@@ -337,6 +349,50 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
         _audioPlaybackEnabled = false;
         Interlocked.Exchange(ref _lastFrameUnixTimeMilliseconds, 0);
     }
+
+    private static async Task StopGStreamerProcessAsync(Process process)
+    {
+        if (process.HasExited)
+            return;
+
+        if (OperatingSystem.IsLinux())
+        {
+            // gst-launch handles SIGINT and, with -e, propagates EOS before
+            // shutting the pipeline down. Escalate only if the graceful path
+            // does not complete within a bounded interval.
+            if (SendSignal(process.Id, SigInt) == 0
+                && await WaitForExitAsync(process, TimeSpan.FromSeconds(2)).ConfigureAwait(false))
+            {
+                return;
+            }
+            if (!process.HasExited)
+                _ = SendSignal(process.Id, SigTerm);
+            if (await WaitForExitAsync(process, TimeSpan.FromSeconds(1)).ConfigureAwait(false))
+                return;
+        }
+
+        if (!process.HasExited)
+            process.Kill(entireProcessTree: true);
+        _ = await WaitForExitAsync(process, TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+    }
+
+    private static async Task<bool> WaitForExitAsync(Process process, TimeSpan timeout)
+    {
+        if (process.HasExited)
+            return true;
+        try
+        {
+            await process.WaitForExitAsync().WaitAsync(timeout).ConfigureAwait(false);
+            return true;
+        }
+        catch (TimeoutException)
+        {
+            return process.HasExited;
+        }
+    }
+
+    [DllImport("libc", EntryPoint = "kill", SetLastError = true)]
+    private static extern int SendSignal(int processId, int signal);
 
     public async ValueTask DisposeAsync()
     {

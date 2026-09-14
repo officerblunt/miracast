@@ -21,7 +21,7 @@ internal sealed class WfdSession : IAsyncDisposable
     private int _height = 720;
     private DateTimeOffset _playStartedAt;
     private bool _rendererStarted;
-    private bool _disposed;
+    private int _disposed;
 
     public WfdSession(
         P2PConnectionContext connection,
@@ -349,9 +349,8 @@ internal sealed class WfdSession : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        if (_disposed)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
-        _disposed = true;
         if (_sessionId is not null)
         {
             using var teardownTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));

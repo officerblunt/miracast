@@ -13,7 +13,10 @@ public sealed class VideoRendererTests
         var arguments = startInfo.ArgumentList.ToArray();
 
         Assert.Contains("address=192.168.137.247", arguments);
+        Assert.Contains("-e", arguments);
         Assert.Contains("h264parse", arguments);
+        Assert.Contains("avdec_h264", arguments);
+        Assert.DoesNotContain("decodebin", arguments);
         Assert.Contains("audio/x-private2-lpcm", arguments);
         Assert.Contains("fakesink", arguments);
         Assert.DoesNotContain("dvdlpcmdec", arguments);
