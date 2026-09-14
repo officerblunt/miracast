@@ -3,7 +3,11 @@
     <OutputType>Exe</OutputType>
     <AssemblyName>multiwall-miracast-worker</AssemblyName>
     <RootNamespace>Miracast.Worker</RootNamespace>
-    <TargetFrameworks>net8.0;net8.0-windows10.0.18362.0</TargetFrameworks>
+    <!-- Linux IDEs must not evaluate the Windows target and its Windows-only
+         project graph. On Windows we keep both targets so either worker can
+         still be published explicitly with -f. -->
+    <TargetFrameworks>net8.0</TargetFrameworks>
+    <TargetFrameworks Condition="'$(OS)' == 'Windows_NT'">net8.0;net8.0-windows10.0.18362.0</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PublishSingleFile>true</PublishSingleFile>
