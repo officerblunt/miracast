@@ -851,14 +851,14 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         return 7236;
     }
 
-    private async Task WaitForPendingScanAsync(CancellationToken cancellationToken)
+    private async Task<bool> WaitForPendingScanAsync(CancellationToken cancellationToken)
     {
         var supplicantInterface = _supplicantInterface
             ?? throw new InvalidOperationException("The wpa_supplicant Wi-Fi interface proxy is unavailable.");
         var reported = false;
-        var prolongedWaitReported = false;
-        var startedAt = DateTime.UtcNow;
-        while (await supplicantInterface.GetAsync<bool>("Scanning")
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (DateTime.UtcNow < deadline
+               && await supplicantInterface.GetAsync<bool>("Scanning")
                    .WaitAsync(cancellationToken).ConfigureAwait(false))
         {
             if (!reported)
@@ -869,18 +869,20 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                     + "automatically when the scan finishes…");
                 reported = true;
             }
-            if (!prolongedWaitReported
-                && DateTime.UtcNow - startedAt >= TimeSpan.FromSeconds(10))
-            {
-                Report(
-                    "The NetworkManager scan is still active; continuing to wait in the background "
-                    + "without queuing P2P commands or blocking the receiver window…");
-                prolongedWaitReported = true;
-            }
             await Task.Delay(250, cancellationToken).ConfigureAwait(false);
         }
-        if (reported)
+        var scanning = await supplicantInterface.GetAsync<bool>("Scanning")
+            .WaitAsync(cancellationToken).ConfigureAwait(false);
+        if (!scanning && reported)
             Report("The NetworkManager scan finished. Starting Wi-Fi Direct discovery now…");
+        else if (scanning)
+        {
+            Report(
+                "The NetworkManager scan state did not clear within 10 seconds. "
+                + "Trying the standard P2P Listen operation to recover discoverability "
+                + "without restarting NetworkManager…");
+        }
+        return !scanning;
     }
 
     private async Task StartDiscoveryAsync(CancellationToken cancellationToken)
@@ -903,17 +905,18 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                     // Never enqueue cleanup operations behind a physical scan.
                     // This wait is cancellable and the discovery retry remains
                     // outside the connection-attempt state machine.
-                    await WaitForPendingScanAsync(cancellationToken).ConfigureAwait(false);
+                    var scanFinished = await WaitForPendingScanAsync(cancellationToken).ConfigureAwait(false);
                     if (_finding)
                         await StopFindAsync(disable: false, cancellationToken).ConfigureAwait(false);
-                    if (!_initialP2PResetCompleted)
+                    if (!_initialP2PResetCompleted && scanFinished)
                     {
                         await ResetStaleP2PStateAsync(p2pDevice, cancellationToken).ConfigureAwait(false);
                         _initialP2PResetCompleted = true;
                     }
-                    await StartSupplicantFindAsync(p2pDevice, cancellationToken).ConfigureAwait(false);
-                    // Direct supplicant Find alternates Search and Listen states and
-                    // keeps the WFD Sink information in its Probe Responses.
+                    await StartSupplicantListenAsync(p2pDevice, cancellationToken).ConfigureAwait(false);
+                    _initialP2PResetCompleted = true;
+                    // Listen-only mode keeps the Sink discoverable without the
+                    // active Search scans that can wedge this adapter/driver.
                     await ConfigureWfdAdvertisementAsync(cancellationToken).ConfigureAwait(false);
                     await VerifyWfdAdvertisementAsync(cancellationToken).ConfigureAwait(false);
                     _finding = true;
@@ -931,14 +934,14 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                     }
                     await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken).ConfigureAwait(false);
                 }
-                catch (DBusException exception) when (IsP2PFindBusy(exception))
+                catch (DBusException exception) when (IsP2POperationBusy(exception))
                 {
                     _finding = false;
                     if (!busyReported)
                     {
                         Report(
-                            "The Wi-Fi driver still has a scan pending. "
-                            + "Cleaning the P2P operation and retrying without restarting NetworkManager…");
+                            "The Wi-Fi driver is still busy. "
+                            + "Retrying P2P Listen without restarting NetworkManager…");
                         busyReported = true;
                     }
                     // Do not enqueue Cancel/Disconnect/StopFind/Flush while the
@@ -954,49 +957,12 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         }
     }
 
-    private async Task StartSupplicantFindAsync(
+    private async Task StartSupplicantListenAsync(
         IWpaP2PDevice p2pDevice,
         CancellationToken cancellationToken)
     {
-        IReadOnlyList<IDictionary<string, object>> optionVariants =
-        [
-            new Dictionary<string, object>
-            {
-                ["Timeout"] = 600,
-                ["DiscoveryType"] = "start_with_full",
-            },
-            new Dictionary<string, object>
-            {
-                ["Timeout"] = 600,
-            },
-            new Dictionary<string, object>(),
-        ];
-
-        DBusException? lastInvalidArguments = null;
-        for (var index = 0; index < optionVariants.Count; index++)
-        {
-            try
-            {
-                await p2pDevice.FindAsync(optionVariants[index])
-                    .WaitAsync(cancellationToken).ConfigureAwait(false);
-                if (index > 0)
-                {
-                    Report(
-                        "This wpa_supplicant accepts only the compatibility form of P2P Find; "
-                        + "discovery was started without unsupported optional arguments.");
-                }
-                return;
-            }
-            catch (DBusException exception) when (IsInvalidArguments(exception))
-            {
-                lastInvalidArguments = exception;
-            }
-        }
-
-        throw new InvalidOperationException(
-            "wpa_supplicant rejected every supported P2P Find argument form. "
-            + "Check that its fi.w1.wpa_supplicant1.Interface.P2PDevice API matches the installed daemon.",
-            lastInvalidArguments);
+        await p2pDevice.ListenAsync(600)
+            .WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private async Task ConfigureWfdAdvertisementAsync(CancellationToken cancellationToken)
@@ -1606,7 +1572,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         }
 
         Report(
-            $"Miracast receiver '{receiverName}' is searching and advertising in P2P mode "
+            $"Miracast receiver '{receiverName}' is advertising in P2P Listen mode "
             + "with WPS Push Button pairing. "
             + "Waiting for a Source to connect…");
     }
@@ -1780,14 +1746,11 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             or "org.freedesktop.DBus.Error.ServiceUnknown"
             or "org.freedesktop.DBus.Error.NameHasNoOwner";
 
-    private static bool IsP2PFindBusy(DBusException exception) =>
+    private static bool IsP2POperationBusy(DBusException exception) =>
         exception.Message.Contains("Could not start P2P find", StringComparison.OrdinalIgnoreCase)
+        || exception.Message.Contains("Could not start P2P listen", StringComparison.OrdinalIgnoreCase)
         || exception.Message.Contains("scan trigger", StringComparison.OrdinalIgnoreCase)
         || exception.Message.Contains("scan pending", StringComparison.OrdinalIgnoreCase);
-
-    private static bool IsInvalidArguments(DBusException exception) =>
-        exception.ErrorName is "fi.w1.wpa_supplicant1.InvalidArgs"
-            or "org.freedesktop.DBus.Error.InvalidArgs";
 
     private static bool IsAccessDenied(DBusException exception) =>
         exception.ErrorName is "org.freedesktop.DBus.Error.AccessDenied"
@@ -2040,7 +2003,6 @@ public interface IWpaSupplicant : IDBusObject
 [DBusInterface("fi.w1.wpa_supplicant1.Interface.P2PDevice")]
 public interface IWpaP2PDevice : IDBusObject
 {
-    Task FindAsync(IDictionary<string, object> options);
     Task ListenAsync(int timeout);
     Task StopFindAsync();
     Task CancelAsync();
