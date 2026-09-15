@@ -7,6 +7,26 @@ namespace Miracast.Receiver.Linux.Tests;
 public sealed class NetworkManagerP2PTests
 {
     [Fact]
+    public void BuildsWpaCliAbortScanWithoutShellInterpolation()
+    {
+        var startInfo = NetworkManagerP2P.CreateWpaCliAbortScanStartInfo("wlan0;reboot");
+
+        Assert.Equal("wpa_cli", startInfo.FileName);
+        Assert.False(startInfo.UseShellExecute);
+        Assert.Equal(new[] { "-i", "wlan0;reboot", "abort_scan" }, startInfo.ArgumentList);
+    }
+
+    [Fact]
+    public void BuildsIwAbortScanWithoutShellInterpolation()
+    {
+        var startInfo = NetworkManagerP2P.CreateIwAbortScanStartInfo("wlan0");
+
+        Assert.Equal("iw", startInfo.FileName);
+        Assert.False(startInfo.UseShellExecute);
+        Assert.Equal(new[] { "dev", "wlan0", "scan", "abort" }, startInfo.ArgumentList);
+    }
+
+    [Fact]
     public async Task ActivationFailureInterruptsPendingNetworkManagerRequest()
     {
         var request = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
