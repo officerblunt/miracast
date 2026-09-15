@@ -14,7 +14,9 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private const uint DeviceStateDisconnected = 30;
     private const uint DeviceStateActivated = 100;
     private const uint DeviceStateFailed = 120;
+    private const int P2PListenBurstSeconds = 1;
     private static readonly TimeSpan ConnectionAttemptTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan P2PListenRecoveryInterval = TimeSpan.FromSeconds(2);
     private readonly Connection _bus = new(Address.System);
     private readonly PeerOperationCoalescer _authorizationOperations = new();
     private readonly PeerOperationCoalescer _disconnectionOperations = new();
@@ -771,8 +773,8 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                     }
                     await StartSupplicantListenAsync(p2pDevice, cancellationToken).ConfigureAwait(false);
                     _initialP2PResetCompleted = true;
-                    // Listen-only mode keeps the Sink discoverable without the
-                    // active Search scans that can wedge this adapter/driver.
+                    // Bounded Listen mode keeps the Sink discoverable without
+                    // active Search scans or starving the connected STA link.
                     await ConfigureWfdAdvertisementAsync(cancellationToken).ConfigureAwait(false);
                     await VerifyWfdAdvertisementAsync(cancellationToken).ConfigureAwait(false);
                     _discovery.MarkListening();
@@ -817,7 +819,12 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         IWpaP2PDevice p2pDevice,
         CancellationToken cancellationToken)
     {
-        await p2pDevice.ListenAsync(600)
+        // A long P2P Listen is implemented by many drivers as a continuous
+        // remain-on-channel operation. On a single radio that starves the
+        // connected STA interface and can drop regular Wi-Fi. Short bursts
+        // preserve discovery while returning the radio to NetworkManager
+        // between bursts.
+        await p2pDevice.ListenAsync(P2PListenBurstSeconds)
             .WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -1128,7 +1135,9 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         _discovery.MarkStopped();
         if (!_discovery.Enabled || _discoveryGate.CurrentCount == 0)
             return;
-        _discovery.QueueRestart("wpa_supplicant stopped P2P discovery");
+        _discovery.QueueRestart(
+            "the bounded P2P Listen interval ended",
+            P2PListenRecoveryInterval);
     }
 
     private void OnGroupStarted(IDictionary<string, object> properties)
@@ -1351,7 +1360,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         }
 
         Report(
-            $"Miracast receiver '{receiverName}' is advertising in P2P Listen mode "
+            $"Miracast receiver '{receiverName}' is advertising in bounded P2P Listen mode "
             + "with WPS Push Button pairing. "
             + "Waiting for a Source to connect…");
     }

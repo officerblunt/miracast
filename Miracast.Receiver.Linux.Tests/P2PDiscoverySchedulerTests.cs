@@ -60,4 +60,37 @@ public sealed class P2PDiscoverySchedulerTests
         lifetime.Cancel();
         await scheduler.StopAsync();
     }
+
+    [Fact]
+    public async Task RestartCanLeaveARecoveryWindowForTheStaConnection()
+    {
+        var firstStart = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondStart = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var starts = 0;
+        using var lifetime = new CancellationTokenSource();
+        var scheduler = new P2PDiscoveryScheduler(
+            () => true,
+            () => DateTime.MinValue,
+            _ =>
+            {
+                if (Interlocked.Increment(ref starts) == 1)
+                    firstStart.TrySetResult();
+                else
+                    secondStart.TrySetResult();
+                return Task.CompletedTask;
+            },
+            _ => { });
+
+        scheduler.Start(lifetime.Token, "the receiver started");
+        await firstStart.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        scheduler.MarkStopped();
+        scheduler.QueueRestart("listen interval ended", TimeSpan.FromMilliseconds(400));
+
+        await Task.Delay(200);
+        Assert.False(secondStart.Task.IsCompleted);
+        await secondStart.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        lifetime.Cancel();
+        await scheduler.StopAsync();
+    }
 }

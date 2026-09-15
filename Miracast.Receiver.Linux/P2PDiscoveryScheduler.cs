@@ -11,6 +11,7 @@ internal sealed class P2PDiscoveryScheduler
     private Task? _renewal;
     private Task? _restart;
     private string? _pendingRestartReason;
+    private TimeSpan _pendingRestartDelay;
     private volatile bool _enabled;
     private volatile bool _listening;
 
@@ -53,7 +54,7 @@ internal sealed class P2PDiscoveryScheduler
 
     internal void MarkStopped() => _listening = false;
 
-    internal void QueueRestart(string reason)
+    internal void QueueRestart(string reason, TimeSpan? delay = null)
     {
         var cancellationToken = _lifetimeToken;
         if (!_enabled || cancellationToken.IsCancellationRequested || !_canAdvertise())
@@ -62,6 +63,7 @@ internal sealed class P2PDiscoveryScheduler
         lock (_restartSync)
         {
             _pendingRestartReason = reason;
+            _pendingRestartDelay = delay ?? TimeSpan.FromMilliseconds(250);
             if (_restart is not { IsCompleted: false })
                 _restart = RunRestartQueueAsync(cancellationToken);
         }
@@ -83,7 +85,10 @@ internal sealed class P2PDiscoveryScheduler
             _restart = null;
         }
         lock (_restartSync)
+        {
             _pendingRestartReason = null;
+            _pendingRestartDelay = TimeSpan.Zero;
+        }
     }
 
     private async Task RenewAsync(CancellationToken cancellationToken)
@@ -113,19 +118,25 @@ internal sealed class P2PDiscoveryScheduler
         while (!cancellationToken.IsCancellationRequested)
         {
             string? reason;
+            TimeSpan delay;
             lock (_restartSync)
             {
                 if (_listening)
+                {
                     _pendingRestartReason = null;
+                    _pendingRestartDelay = TimeSpan.Zero;
+                }
                 reason = _pendingRestartReason;
+                delay = _pendingRestartDelay;
                 _pendingRestartReason = null;
+                _pendingRestartDelay = TimeSpan.Zero;
                 if (reason is null)
                 {
                     _restart = null;
                     return;
                 }
             }
-            await RestartAsync(reason, cancellationToken).ConfigureAwait(false);
+            await RestartAsync(reason, delay, cancellationToken).ConfigureAwait(false);
         }
 
         lock (_restartSync)
@@ -135,7 +146,10 @@ internal sealed class P2PDiscoveryScheduler
         }
     }
 
-    private async Task RestartAsync(string reason, CancellationToken cancellationToken)
+    private async Task RestartAsync(
+        string reason,
+        TimeSpan delay,
+        CancellationToken cancellationToken)
     {
         try
         {
@@ -150,7 +164,7 @@ internal sealed class P2PDiscoveryScheduler
                         : TimeSpan.FromSeconds(1),
                     cancellationToken).ConfigureAwait(false);
             }
-            await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken).ConfigureAwait(false);
+            await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
             if (!_enabled || !_canAdvertise())
                 return;
             _report($"Restarting Wi-Fi Direct discovery because {reason}…");
