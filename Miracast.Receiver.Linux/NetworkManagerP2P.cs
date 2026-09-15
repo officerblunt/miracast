@@ -170,7 +170,13 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             exception => Report($"Wi-Fi P2P discovery failed: {exception.Message}"))
             .WaitAsync(cancellationToken).ConfigureAwait(false));
 
-        await StartDiscoveryAsync(cancellationToken).ConfigureAwait(false);
+        // A NetworkManager-owned physical scan cannot be cancelled safely and
+        // may keep the radio busy for an arbitrary amount of time. Receiver
+        // startup must not wait for it: discovery will begin as soon as the
+        // adapter becomes available.
+        _shouldFind = true;
+        Report("Miracast receiver initialized. Starting Wi-Fi Direct discovery in the background…");
+        QueueDiscoveryRestart("the receiver started");
         _findRenewal = RenewDiscoveryAsync(_lifetime.Token);
 
         var peers = await _p2pDevice.GetAsync<ObjectPath[]>("Peers")
@@ -849,26 +855,31 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         var supplicantInterface = _supplicantInterface
             ?? throw new InvalidOperationException("The wpa_supplicant Wi-Fi interface proxy is unavailable.");
         var reported = false;
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
-        while (DateTime.UtcNow < deadline
-               && await supplicantInterface.GetAsync<bool>("Scanning")
+        var prolongedWaitReported = false;
+        var startedAt = DateTime.UtcNow;
+        while (await supplicantInterface.GetAsync<bool>("Scanning")
                    .WaitAsync(cancellationToken).ConfigureAwait(false))
         {
             if (!reported)
             {
                 Report(
-                    "The physical Wi-Fi adapter is finishing an existing scan. "
-                    + "Waiting before starting Wi-Fi Direct discovery…");
+                    "The physical Wi-Fi adapter is running a NetworkManager scan. "
+                    + "The receiver remains started and will enable Wi-Fi Direct discovery "
+                    + "automatically when the scan finishes…");
                 reported = true;
+            }
+            if (!prolongedWaitReported
+                && DateTime.UtcNow - startedAt >= TimeSpan.FromSeconds(10))
+            {
+                Report(
+                    "The NetworkManager scan is still active; continuing to wait in the background "
+                    + "without queuing P2P commands or blocking the receiver window…");
+                prolongedWaitReported = true;
             }
             await Task.Delay(250, cancellationToken).ConfigureAwait(false);
         }
-        if (reported && DateTime.UtcNow >= deadline)
-        {
-            Report(
-                "The existing Wi-Fi scan did not finish within 10 seconds. "
-                + "Attempting Wi-Fi Direct discovery directly…");
-        }
+        if (reported)
+            Report("The NetworkManager scan finished. Starting Wi-Fi Direct discovery now…");
     }
 
     private async Task StartDiscoveryAsync(CancellationToken cancellationToken)
