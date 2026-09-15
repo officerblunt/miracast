@@ -12,7 +12,7 @@ public interface IWpaSupplicant : IDBusObject
 [DBusInterface("fi.w1.wpa_supplicant1.Interface.P2PDevice")]
 public interface IWpaP2PDevice : IDBusObject
 {
-    Task ListenAsync(int timeout);
+    Task ExtendedListenAsync(IDictionary<string, object> options);
     Task StopFindAsync();
     Task CancelAsync();
     Task FlushAsync();
@@ -57,9 +57,6 @@ public interface IWpaP2PDevice : IDBusObject
         Action<Exception>? onError = null);
     Task<IDisposable> WatchGroupFinishedAsync(
         Action<IDictionary<string, object>> handler,
-        Action<Exception>? onError = null);
-    Task<IDisposable> WatchFindStoppedAsync(
-        Action handler,
         Action<Exception>? onError = null);
 }
 

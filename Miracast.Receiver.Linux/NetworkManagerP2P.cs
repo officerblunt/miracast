@@ -14,9 +14,9 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private const uint DeviceStateDisconnected = 30;
     private const uint DeviceStateActivated = 100;
     private const uint DeviceStateFailed = 120;
-    private const int P2PListenBurstSeconds = 1;
+    private const int P2PExtendedListenPeriodMilliseconds = 500;
+    private const int P2PExtendedListenIntervalMilliseconds = 2000;
     private static readonly TimeSpan ConnectionAttemptTimeout = TimeSpan.FromSeconds(30);
-    private static readonly TimeSpan P2PListenRecoveryInterval = TimeSpan.FromSeconds(2);
     private readonly Connection _bus = new(Address.System);
     private readonly PeerOperationCoalescer _authorizationOperations = new();
     private readonly PeerOperationCoalescer _disconnectionOperations = new();
@@ -591,8 +591,8 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         var p2pDevice = _supplicantP2PDevice;
         if (p2pDevice is null)
             return;
+        await StopListeningAsync(cancellationToken).ConfigureAwait(false);
         await ResetStaleP2PStateAsync(p2pDevice, cancellationToken).ConfigureAwait(false);
-        _discovery.MarkStopped();
     }
 
     public Task DisconnectCurrentAsync()
@@ -821,12 +821,15 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         IWpaP2PDevice p2pDevice,
         CancellationToken cancellationToken)
     {
-        // A long P2P Listen is implemented by many drivers as a continuous
-        // remain-on-channel operation. On a single radio that starves the
-        // connected STA interface and can drop regular Wi-Fi. Short bursts
-        // preserve discovery while returning the radio to NetworkManager
-        // between bursts.
-        await p2pDevice.ListenAsync(P2PListenBurstSeconds)
+        // Extended Listen is scheduled by wpa_supplicant itself. The radio is
+        // discoverable for a bounded period and returns to the connected STA
+        // between periods, without relying on a one-shot Listen completion
+        // signal that some drivers never emit over D-Bus.
+        await p2pDevice.ExtendedListenAsync(new Dictionary<string, object>
+            {
+                ["period"] = P2PExtendedListenPeriodMilliseconds,
+                ["interval"] = P2PExtendedListenIntervalMilliseconds,
+            })
             .WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -1003,10 +1006,6 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                 OnGroupFinished,
                 exception => Report($"Could not monitor P2P group shutdown: {exception.Message}"))
                 .WaitAsync(cancellationToken).ConfigureAwait(false));
-            _subscriptions.Add(await p2pDevice.WatchFindStoppedAsync(
-                OnSupplicantDiscoveryStopped,
-                exception => Report($"Could not monitor P2P discovery state: {exception.Message}"))
-                .WaitAsync(cancellationToken).ConfigureAwait(false));
             _incomingRequestSubscriptionsConfigured = true;
         }
     }
@@ -1130,16 +1129,6 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                 + "P2P will use automatic channel selection.");
             return null;
         }
-    }
-
-    private void OnSupplicantDiscoveryStopped()
-    {
-        _discovery.MarkStopped();
-        if (!_discovery.Enabled || _discoveryGate.CurrentCount == 0)
-            return;
-        _discovery.QueueRestart(
-            "the bounded P2P Listen interval ended",
-            P2PListenRecoveryInterval);
     }
 
     private void OnGroupStarted(IDictionary<string, object> properties)
@@ -1362,7 +1351,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         }
 
         Report(
-            $"Miracast receiver '{receiverName}' is advertising in bounded P2P Listen mode "
+            $"Miracast receiver '{receiverName}' is advertising in periodic P2P Listen mode "
             + "with WPS Push Button pairing. "
             + "Waiting for a Source to connect…");
     }
@@ -1527,12 +1516,12 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         {
             try
             {
-                await _supplicantP2PDevice.StopFindAsync()
+                await _supplicantP2PDevice.ExtendedListenAsync(new Dictionary<string, object>())
                     .WaitAsync(cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
             catch (DBusException) { }
-            catch (Exception exception) { Report($"Could not stop P2P listen: {exception.Message}"); }
+            catch (Exception exception) { Report($"Could not stop periodic P2P listen: {exception.Message}"); }
         }
         _discovery.MarkStopped();
     }
