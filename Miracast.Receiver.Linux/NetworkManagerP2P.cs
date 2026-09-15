@@ -542,8 +542,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         {
             var group = await p2pDevice.GetAsync<ObjectPath>("Group")
                 .WaitAsync(cancellationToken).ConfigureAwait(false);
-            if (group.ToString() != "/")
-                return true;
+            return P2PAddressing.IsConcreteGroupObjectPath(group);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -553,7 +552,10 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         {
         }
 
-        return P2PAddressing.GetGroupInterfaceNames().Length > 0;
+        // A p2p-* interface elsewhere in the system does not prove that this
+        // P2P management device owns it. Calling Disconnect on that assumption
+        // can disconnect the selected adapter's regular STA connection.
+        return false;
     }
 
     private static async Task<bool> TryP2POperationAsync(

@@ -17,6 +17,9 @@ internal static class P2PAddressing
         name.StartsWith("p2p-", StringComparison.OrdinalIgnoreCase)
         && !name.StartsWith("p2p-dev-", StringComparison.OrdinalIgnoreCase);
 
+    internal static bool IsConcreteGroupObjectPath(ObjectPath groupPath) =>
+        groupPath.ToString() != "/";
+
     internal static IPAddress? GetLocalAddress(IDictionary<string, object> properties)
     {
         if (!properties.TryGetValue("AddressData", out var value))

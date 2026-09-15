@@ -48,6 +48,14 @@ public sealed class NetworkManagerP2PTests
         Assert.Equal(expected, P2PAddressing.IsGroupInterfaceName(name));
     }
 
+    [Theory]
+    [InlineData("/", false)]
+    [InlineData("/fi/w1/wpa_supplicant1/Interfaces/21/Groups/AB", true)]
+    public void TrustsOnlyAnExplicitSupplicantGroupPath(string path, bool expected)
+    {
+        Assert.Equal(expected, P2PAddressing.IsConcreteGroupObjectPath(new ObjectPath(path)));
+    }
+
     [Fact]
     public void GetGroupAddress_ParsesAddressReportedBySupplicant()
     {
