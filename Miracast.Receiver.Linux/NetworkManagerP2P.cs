@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using System.Diagnostics;
 using System.Net;
 using System.Net.NetworkInformation;
 using Tmds.DBus;
@@ -856,13 +855,6 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     {
         var supplicantInterface = _supplicantInterface
             ?? throw new InvalidOperationException("The wpa_supplicant Wi-Fi interface proxy is unavailable.");
-        if (!await supplicantInterface.GetAsync<bool>("Scanning")
-                .WaitAsync(cancellationToken).ConfigureAwait(false))
-        {
-            return;
-        }
-
-        await AbortPhysicalScanIfNeededAsync(cancellationToken).ConfigureAwait(false);
         var reported = false;
         var prolongedWaitReported = false;
         var startedAt = DateTime.UtcNow;
@@ -889,137 +881,6 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         }
         if (reported)
             Report("The NetworkManager scan finished. Starting Wi-Fi Direct discovery now…");
-    }
-
-    private async Task AbortPhysicalScanIfNeededAsync(CancellationToken cancellationToken)
-    {
-        var supplicantInterface = _supplicantInterface;
-        var interfaceName = _parentWifiInterfaceName;
-        if (supplicantInterface is null || string.IsNullOrWhiteSpace(interfaceName))
-            return;
-        if (!await supplicantInterface.GetAsync<bool>("Scanning")
-                .WaitAsync(cancellationToken).ConfigureAwait(false))
-        {
-            return;
-        }
-
-        Report(
-            $"The physical Wi-Fi adapter {interfaceName} is scanning; "
-            + "requesting ABORT_SCAN before starting Wi-Fi Direct…");
-        var attempts = new[]
-        {
-            CreateWpaCliAbortScanStartInfo(interfaceName),
-            CreateIwAbortScanStartInfo(interfaceName),
-        };
-        var failures = new List<string>();
-        foreach (var attempt in attempts)
-        {
-            var result = await RunScanAbortCommandAsync(attempt, cancellationToken).ConfigureAwait(false);
-            if (result.Success)
-            {
-                Report($"Cancelled the active Wi-Fi scan using {attempt.FileName}.");
-                return;
-            }
-            failures.Add($"{attempt.FileName}: {result.Details}");
-        }
-
-        Report(
-            "Could not cancel the active Wi-Fi scan ("
-            + string.Join("; ", failures)
-            + "). The receiver remains running and will retry P2P discovery in the background.");
-    }
-
-    internal static ProcessStartInfo CreateWpaCliAbortScanStartInfo(string interfaceName) =>
-        CreateScanAbortStartInfo(
-            ResolveExecutable("wpa_cli", "/usr/sbin/wpa_cli", "/sbin/wpa_cli", "/usr/bin/wpa_cli"),
-            "-i",
-            interfaceName,
-            "abort_scan");
-
-    internal static ProcessStartInfo CreateIwAbortScanStartInfo(string interfaceName) =>
-        CreateScanAbortStartInfo(
-            ResolveExecutable("iw", "/usr/sbin/iw", "/sbin/iw", "/usr/bin/iw"),
-            "dev",
-            interfaceName,
-            "scan",
-            "abort");
-
-    private static string ResolveExecutable(string fallback, params string[] linuxPaths)
-    {
-        if (OperatingSystem.IsLinux())
-        {
-            var resolved = linuxPaths.FirstOrDefault(File.Exists);
-            if (resolved is not null)
-                return resolved;
-        }
-        return fallback;
-    }
-
-    private static ProcessStartInfo CreateScanAbortStartInfo(
-        string executable,
-        params string[] arguments)
-    {
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = executable,
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true,
-        };
-        foreach (var argument in arguments)
-            startInfo.ArgumentList.Add(argument);
-        return startInfo;
-    }
-
-    private static async Task<(bool Success, string Details)> RunScanAbortCommandAsync(
-        ProcessStartInfo startInfo,
-        CancellationToken cancellationToken)
-    {
-        using var process = new Process { StartInfo = startInfo };
-        try
-        {
-            if (!process.Start())
-                return (false, "process did not start");
-        }
-        catch (Exception exception)
-        {
-            return (false, exception.Message);
-        }
-
-        var output = process.StandardOutput.ReadToEndAsync();
-        var error = process.StandardError.ReadToEndAsync();
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(TimeSpan.FromSeconds(2));
-        try
-        {
-            await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-        {
-            try { process.Kill(entireProcessTree: true); }
-            catch { }
-            return (false, "timed out after 2 seconds");
-        }
-        catch (OperationCanceledException)
-        {
-            try { process.Kill(entireProcessTree: true); }
-            catch { }
-            throw;
-        }
-
-        var standardOutput = (await output.ConfigureAwait(false)).Trim();
-        var standardError = (await error.ConfigureAwait(false)).Trim();
-        var details = string.Join(
-            " ",
-            new[] { standardOutput, standardError }.Where(static value => value.Length > 0));
-        if (process.ExitCode == 0
-            && (!Path.GetFileName(startInfo.FileName).Equals("wpa_cli", StringComparison.Ordinal)
-                || standardOutput.Split('\n', StringSplitOptions.TrimEntries).Contains("OK")))
-        {
-            return (true, details);
-        }
-        return (false, details.Length > 0 ? details : $"exit code {process.ExitCode}");
     }
 
     private async Task StartDiscoveryAsync(CancellationToken cancellationToken)
