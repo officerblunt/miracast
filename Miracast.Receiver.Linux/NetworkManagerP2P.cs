@@ -15,7 +15,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private const uint DeviceStateDisconnected = 30;
     private const uint DeviceStateActivated = 100;
     private const uint DeviceStateFailed = 120;
-    private static readonly TimeSpan ConnectionAttemptTimeout = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan ConnectionAttemptTimeout = TimeSpan.FromSeconds(30);
     private const string DeviceNotActiveError = "org.freedesktop.NetworkManager.Device.NotActive";
     private static readonly byte[] SinkWfdInformationElements =
         [0x00, 0x00, 0x06, 0x00, 0x11, 0x1c, 0x44, 0x00, 0xc8];
@@ -25,6 +25,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private readonly Connection _bus = new(Address.System);
     private readonly PeerOperationCoalescer _authorizationOperations = new();
     private readonly PeerOperationCoalescer _disconnectionOperations = new();
+    private readonly object _discoveryRestartSync = new();
     private readonly SemaphoreSlim _authorizationGate = new(1, 1);
     private readonly SemaphoreSlim _discoveryGate = new(1, 1);
     private readonly List<IDisposable> _subscriptions = [];
@@ -47,6 +48,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private CancellationTokenSource? _lifetime;
     private Task? _findRenewal;
     private Task? _findRestart;
+    private string? _pendingDiscoveryRestartReason;
     private Task? _addressConfiguration;
     private CancellationTokenSource? _addressConfigurationLifetime;
     private TaskCompletionSource? _pendingActivation;
@@ -285,7 +287,11 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             _authorizedPeerAddress = normalizedAddress;
             _authorizedPeer = peer;
             _authorizationExpiresAt = DateTime.MaxValue;
-            await StopFindAsync(disable: true, attemptToken).ConfigureAwait(false);
+            // AddAndActivateConnection2/P2P_CONNECT stops an active find itself.
+            // Sending an explicit StopFind while the driver has a scan pending
+            // can be queued by wpa_supplicant and delay WPS for several minutes.
+            _shouldFind = false;
+            _finding = false;
             await ConfigureConcurrentWifiChannelAsync(attemptToken).ConfigureAwait(false);
             Report(
                 $"Connection attempt #{attemptId} from {peer.Name} started with a "
@@ -330,7 +336,10 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                 peer.Path,
                 options);
             _ = ObserveAbandonedActivationAsync(activationRequest);
-            var result = await activationRequest.WaitAsync(attemptToken).ConfigureAwait(false);
+            var result = await WaitForActivationRequestAsync(
+                activationRequest,
+                activated.Task,
+                attemptToken).ConfigureAwait(false);
 
             _activeConnection = result.activeConnection;
             Report(
@@ -366,20 +375,19 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             }
             DisposeActivationBus();
             Volatile.Write(ref _currentAttemptId, 0);
-            if (_supplicantP2PDevice is { } p2pDevice)
-            {
-                await ResetStaleP2PStateAsync(
-                    p2pDevice,
-                    recoveryToken).ConfigureAwait(false);
-            }
             _activeStateSubscription?.Dispose();
             _activeStateSubscription = null;
             _currentGroupObjectPath = null;
+            _groupP2PDevice = null;
+            // Defer supplicant cleanup until discovery has confirmed that the
+            // physical scan is over. Otherwise these calls accumulate in the
+            // driver and all execute much later in one burst.
+            _initialP2PResetCompleted = false;
             ResetPendingAuthorization();
             if (!receiverToken.IsCancellationRequested)
             {
-                try { await StartDiscoveryAsync(receiverToken).ConfigureAwait(false); }
-                catch { }
+                _shouldFind = true;
+                QueueDiscoveryRestart("the connection attempt failed");
             }
             if (timedOut)
             {
@@ -406,6 +414,22 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     {
         try { await activation.ConfigureAwait(false); }
         catch { }
+    }
+
+    internal static async Task<T> WaitForActivationRequestAsync<T>(
+        Task<T> activationRequest,
+        Task activationState,
+        CancellationToken cancellationToken)
+    {
+        var first = await Task.WhenAny(activationRequest, activationState)
+            .WaitAsync(cancellationToken).ConfigureAwait(false);
+        if (ReferenceEquals(first, activationState))
+        {
+            // A failed GO negotiation or group formation is authoritative and
+            // must interrupt the still-pending NetworkManager D-Bus request.
+            await activationState.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        return await activationRequest.WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     internal static Dictionary<string, IDictionary<string, object>> CreateP2PConnectionSettings(
@@ -861,17 +885,20 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             {
                 try
                 {
-                    if (_finding)
-                        await StopFindAsync(disable: false, cancellationToken).ConfigureAwait(false);
                     await ConfigureWfdAdvertisementAsync(cancellationToken).ConfigureAwait(false);
                     var p2pDevice = _supplicantP2PDevice
                         ?? throw new InvalidOperationException("The wpa_supplicant P2PDevice proxy is not available.");
+                    // Never enqueue cleanup operations behind a physical scan.
+                    // This wait is cancellable and the discovery retry remains
+                    // outside the connection-attempt state machine.
+                    await WaitForPendingScanAsync(cancellationToken).ConfigureAwait(false);
+                    if (_finding)
+                        await StopFindAsync(disable: false, cancellationToken).ConfigureAwait(false);
                     if (!_initialP2PResetCompleted)
                     {
                         await ResetStaleP2PStateAsync(p2pDevice, cancellationToken).ConfigureAwait(false);
                         _initialP2PResetCompleted = true;
                     }
-                    await WaitForPendingScanAsync(cancellationToken).ConfigureAwait(false);
                     await StartSupplicantFindAsync(p2pDevice, cancellationToken).ConfigureAwait(false);
                     // Direct supplicant Find alternates Search and Listen states and
                     // keeps the WFD Sink information in its Probe Responses.
@@ -1790,9 +1817,42 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         var lifetime = _lifetime;
         if (!_shouldFind || lifetime is null || lifetime.IsCancellationRequested || _groupP2PDevice is not null)
             return;
-        if (_findRestart is { IsCompleted: false })
-            return;
-        _findRestart = RestartDiscoveryAsync(reason, lifetime.Token);
+        lock (_discoveryRestartSync)
+        {
+            _pendingDiscoveryRestartReason = reason;
+            if (_findRestart is not { IsCompleted: false })
+                _findRestart = RunDiscoveryRestartQueueAsync(lifetime.Token);
+        }
+    }
+
+    private async Task RunDiscoveryRestartQueueAsync(CancellationToken cancellationToken)
+    {
+        // Ensure QueueDiscoveryRestart assigns _findRestart before this worker
+        // can clear it, even when cancellation has already been requested.
+        await Task.Yield();
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            string? reason;
+            lock (_discoveryRestartSync)
+            {
+                if (_finding)
+                    _pendingDiscoveryRestartReason = null;
+                reason = _pendingDiscoveryRestartReason;
+                _pendingDiscoveryRestartReason = null;
+                if (reason is null)
+                {
+                    _findRestart = null;
+                    return;
+                }
+            }
+            await RestartDiscoveryAsync(reason, cancellationToken).ConfigureAwait(false);
+        }
+
+        lock (_discoveryRestartSync)
+        {
+            _pendingDiscoveryRestartReason = null;
+            _findRestart = null;
+        }
     }
 
     private async Task RestartDiscoveryAsync(string reason, CancellationToken cancellationToken)
@@ -1810,7 +1870,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                         : TimeSpan.FromSeconds(1),
                     cancellationToken).ConfigureAwait(false);
             }
-            await Task.Delay(TimeSpan.FromMilliseconds(750), cancellationToken).ConfigureAwait(false);
+            await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken).ConfigureAwait(false);
             if (!_shouldFind || _groupP2PDevice is not null)
                 return;
             Report($"Restarting Wi-Fi Direct discovery because {reason}…");

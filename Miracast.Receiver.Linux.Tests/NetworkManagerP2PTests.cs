@@ -6,6 +6,38 @@ namespace Miracast.Receiver.Linux.Tests;
 
 public sealed class NetworkManagerP2PTests
 {
+    [Fact]
+    public async Task ActivationFailureInterruptsPendingNetworkManagerRequest()
+    {
+        var request = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var state = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failure = new InvalidOperationException("GO negotiation failed");
+
+        var waiting = NetworkManagerP2P.WaitForActivationRequestAsync(
+            request.Task,
+            state.Task,
+            CancellationToken.None);
+        state.SetException(failure);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => waiting);
+        Assert.Same(failure, exception);
+        Assert.False(request.Task.IsCompleted);
+    }
+
+    [Fact]
+    public async Task CompletedNetworkManagerRequestDoesNotWaitForLaterStateEvent()
+    {
+        var state = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var result = await NetworkManagerP2P.WaitForActivationRequestAsync(
+            Task.FromResult("active connection"),
+            state.Task,
+            CancellationToken.None);
+
+        Assert.Equal("active connection", result);
+        Assert.False(state.Task.IsCompleted);
+    }
+
     [Theory]
     [InlineData("p2p-0", true)]
     [InlineData("p2p-wlan0-1", true)]
