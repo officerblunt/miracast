@@ -45,7 +45,7 @@ public sealed class NetworkManagerP2PTests
     [InlineData("wlan0", false)]
     public void IdentifiesOnlyP2PGroupInterfaces(string name, bool expected)
     {
-        Assert.Equal(expected, NetworkManagerP2P.IsP2PGroupInterfaceName(name));
+        Assert.Equal(expected, P2PAddressing.IsGroupInterfaceName(name));
     }
 
     [Fact]
@@ -56,7 +56,7 @@ public sealed class NetworkManagerP2PTests
             ["IpAddr"] = new byte[] { 192, 168, 49, 24 },
         };
 
-        var address = NetworkManagerP2P.GetGroupAddress(properties, "IpAddr");
+        var address = P2PAddressing.GetGroupAddress(properties, "IpAddr");
 
         Assert.Equal(IPAddress.Parse("192.168.49.24"), address);
     }
@@ -71,7 +71,7 @@ public sealed class NetworkManagerP2PTests
         if (value is not null)
             properties["IpAddr"] = value;
 
-        Assert.Null(NetworkManagerP2P.GetGroupAddress(properties, "IpAddr"));
+        Assert.Null(P2PAddressing.GetGroupAddress(properties, "IpAddr"));
     }
 
     [Theory]
@@ -80,20 +80,7 @@ public sealed class NetworkManagerP2PTests
     [InlineData("255.0.255.0", null)]
     public void GetPrefixLength_ValidatesNetmask(string netmask, int? expected)
     {
-        Assert.Equal(expected, NetworkManagerP2P.GetPrefixLength(IPAddress.Parse(netmask)));
-    }
-
-    [Theory]
-    [InlineData("p2p-dev-wlan0", "wlan0", true)]
-    [InlineData("p2p-wlan0-0", "wlan0", true)]
-    [InlineData("wlan0", "wlan0", true)]
-    [InlineData("p2p-dev-wlan1", "wlan0", false)]
-    public void MatchesP2PDeviceToItsPhysicalWifiInterface(
-        string p2pInterface,
-        string wifiInterface,
-        bool expected)
-    {
-        Assert.Equal(expected, NetworkManagerP2P.IsSameRadioInterface(p2pInterface, wifiInterface));
+        Assert.Equal(expected, P2PAddressing.GetPrefixLength(IPAddress.Parse(netmask)));
     }
 
     [Theory]
@@ -110,7 +97,7 @@ public sealed class NetworkManagerP2PTests
         uint expectedClass,
         uint expectedChannel)
     {
-        var converted = NetworkManagerP2P.TryGetP2POperatingChannel(
+        var converted = P2PNetworkConfiguration.TryGetOperatingChannel(
             frequency,
             out var operatingClass,
             out var channel);
@@ -126,7 +113,7 @@ public sealed class NetworkManagerP2PTests
     [InlineData(5955)]
     public void RejectsUnsupportedP2POperatingFrequency(int frequency)
     {
-        Assert.False(NetworkManagerP2P.TryGetP2POperatingChannel(
+        Assert.False(P2PNetworkConfiguration.TryGetOperatingChannel(
             frequency,
             out _,
             out _));
@@ -135,7 +122,7 @@ public sealed class NetworkManagerP2PTests
     [Fact]
     public void P2PConnectionIsIsolatedFromDefaultRouteAndDnsBeforeActivation()
     {
-        var settings = NetworkManagerP2P.CreateP2PConnectionSettings(
+        var settings = P2PNetworkConfiguration.CreateConnectionSettings(
             "Source",
             "42:AE:30:AB:8C:A2");
 
@@ -155,7 +142,7 @@ public sealed class NetworkManagerP2PTests
     [Fact]
     public void P2PDeviceUsesDedicatedGroupInterface()
     {
-        var configuration = NetworkManagerP2P.CreateP2PDeviceConfiguration("Receiver");
+        var configuration = P2PNetworkConfiguration.CreateDeviceConfiguration("Receiver");
 
         Assert.Equal(false, configuration["NoGroupIface"]);
     }
@@ -167,7 +154,7 @@ public sealed class NetworkManagerP2PTests
     [InlineData("wlan0", null)]
     public void ExtractsOnlyNetworkManagerP2PParentInterface(string name, string? expected)
     {
-        Assert.Equal(expected, NetworkManagerP2P.GetParentWifiInterfaceName(name));
+        Assert.Equal(expected, P2PDeviceSelector.GetParentWifiInterfaceName(name));
     }
 
     [Theory]
@@ -182,7 +169,7 @@ public sealed class NetworkManagerP2PTests
     {
         Assert.Equal(
             expected,
-            NetworkManagerP2P.IsSupplicantInterfaceForP2PDevice(
+            P2PDeviceSelector.IsSupplicantInterfaceForP2PDevice(
                 supplicantInterface,
                 p2pInterface));
     }
@@ -206,7 +193,7 @@ public sealed class NetworkManagerP2PTests
                 30),
         };
 
-        var selected = NetworkManagerP2P.SelectP2PDeviceCandidate(candidates);
+        var selected = P2PDeviceSelector.Select(candidates);
 
         Assert.NotNull(selected);
         Assert.Equal("p2p-dev-wlan1", selected.InterfaceName);
@@ -235,7 +222,7 @@ public sealed class NetworkManagerP2PTests
                 100),
         };
 
-        var selected = NetworkManagerP2P.SelectP2PDeviceCandidate(candidates);
+        var selected = P2PDeviceSelector.Select(candidates);
 
         Assert.NotNull(selected);
         Assert.Equal("p2p-dev-wlan0", selected.InterfaceName);
@@ -260,7 +247,7 @@ public sealed class NetworkManagerP2PTests
                 100),
         };
 
-        var selected = NetworkManagerP2P.SelectP2PDeviceCandidate(candidates);
+        var selected = P2PDeviceSelector.Select(candidates);
 
         Assert.NotNull(selected);
         Assert.Equal("p2p-dev-wlan0", selected.InterfaceName);
@@ -281,7 +268,7 @@ public sealed class NetworkManagerP2PTests
             state,
             30);
 
-        Assert.Null(NetworkManagerP2P.SelectP2PDeviceCandidate(new[] { candidate }));
+        Assert.Null(P2PDeviceSelector.Select(new[] { candidate }));
     }
 
     [Fact]
@@ -303,7 +290,7 @@ public sealed class NetworkManagerP2PTests
                 100),
         };
 
-        var selected = NetworkManagerP2P.SelectP2PDeviceCandidate(candidates);
+        var selected = P2PDeviceSelector.Select(candidates);
 
         Assert.NotNull(selected);
         Assert.Equal("p2p-dev-wlan0", selected.InterfaceName);
