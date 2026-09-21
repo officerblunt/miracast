@@ -10,7 +10,7 @@ public sealed class WfdDisplayCapabilitiesTests
         var capabilities = new WfdDisplayCapabilities(3840, 1080);
 
         Assert.Equal("0f00 0438 001e", capabilities.MicrosoftCustomVideoFormats);
-        Assert.Equal("000000000000", capabilities.MicrosoftVideoFormats);
+        Assert.Equal("none", capabilities.MicrosoftVideoFormats);
         Assert.StartsWith("38 01 ", capabilities.LegacyVideoFormats);
         Assert.StartsWith("0098 01 ", capabilities.ExtendedVideoFormats);
         Assert.EndsWith(" 1000 0870", capabilities.ExtendedVideoFormats);
@@ -64,7 +64,7 @@ public sealed class WfdDisplayCapabilitiesTests
         Assert.False(capabilities.Contains(1920, 1080));
         Assert.True(capabilities.CanDecode(1920, 1080));
         Assert.True(capabilities.CanDecode(3240, 2160));
-        Assert.Equal("000000000000", capabilities.MicrosoftVideoFormats);
+        Assert.Equal("none", capabilities.MicrosoftVideoFormats);
     }
 
     [Fact]
@@ -77,7 +77,7 @@ public sealed class WfdDisplayCapabilitiesTests
         Assert.Equal(2560, capabilities.NativeWidth);
         Assert.Equal(1440, capabilities.NativeHeight);
         Assert.Equal("1e00 05a0 001e", capabilities.MicrosoftCustomVideoFormats);
-        Assert.Equal("000000000000", capabilities.MicrosoftVideoFormats);
+        Assert.Equal("none", capabilities.MicrosoftVideoFormats);
         Assert.StartsWith("0098 01 ", capabilities.ExtendedVideoFormats);
         Assert.StartsWith("60 01 01 0080 ", capabilities.Wfd2VideoFormats);
         Assert.Contains(", 01 02 0080 ", capabilities.Wfd2VideoFormats);

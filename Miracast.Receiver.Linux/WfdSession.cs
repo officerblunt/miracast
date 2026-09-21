@@ -202,7 +202,7 @@ internal sealed class WfdSession : IAsyncDisposable
         }
 
         _ports ??= RtpPortReservation.Reserve();
-        var requested = request.Body.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var requested = request.Body.Split((char[])['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         _report($"WFD Source requested M3 capabilities: {string.Join(", ", requested)}.");
         var requestsWfd2Video = requested.Contains("wfd2_video_formats", StringComparer.OrdinalIgnoreCase);
         var requestsWfd2Audio = requested.Contains("wfd2_audio_codecs", StringComparer.OrdinalIgnoreCase);
@@ -225,9 +225,23 @@ internal sealed class WfdSession : IAsyncDisposable
 
         // WFD 2.1 requires the R1 video/audio parameters to be omitted when
         // their WFD2 counterparts were requested in the same M3 message.
-        var responseParameters = requested.Where(name =>
+        var filteredRequest = requested.Where(name =>
             !(requestsWfd2Video && name.Equals("wfd_video_formats", StringComparison.OrdinalIgnoreCase))
             && !(requestsWfd2Audio && name.Equals("wfd_audio_codecs", StringComparison.OrdinalIgnoreCase)));
+
+        // wfd2_video_formats has no custom-resolution field at all (Wi-Fi
+        // Display 2.1 section 6.1.22): its CEA/VESA/HH tables top out at
+        // 4096x2160, with no escape hatch. wfdx_video_formats and
+        // microsoft_custom_video_formats are the only parameters that carry
+        // an arbitrary width/height (MS-WFDPE sections 2.7.1.1/2.7.1.3), so
+        // they are always offered even when the Source's M3 request did not
+        // list them by name: GET_PARAMETER only asks for the keys a given
+        // Source implementation already knows about, but nothing in RTSP
+        // forbids answering with additional lines, and a Source that
+        // recognizes them can still use them to pick a wall-sized mode.
+        string[] alwaysOfferedForCustomResolution = ["wfdx_video_formats", "microsoft_custom_video_formats"];
+        var responseParameters = filteredRequest.Concat(
+            alwaysOfferedForCustomResolution.Where(name => !requested.Contains(name, StringComparer.OrdinalIgnoreCase)));
         var body = string.Join(string.Empty, responseParameters.Select(name =>
             values.TryGetValue(name, out var value) ? $"{name}: {value}\r\n" : $"{name}: none\r\n"));
         _report(
@@ -235,7 +249,10 @@ internal sealed class WfdSession : IAsyncDisposable
             + $"{_displayCapabilities.NativeHeight}, wall={_displayCapabilities.Width}x"
             + $"{_displayCapabilities.Height}, microsoft_video_formats="
             + $"{_displayCapabilities.MicrosoftVideoFormats}, custom="
-            + $"{(requested.Contains("microsoft_custom_video_formats", StringComparer.OrdinalIgnoreCase) ? _displayCapabilities.MicrosoftCustomVideoFormats : "not requested")}, "
+            + $"{_displayCapabilities.MicrosoftCustomVideoFormats} "
+            + $"({(requested.Contains("microsoft_custom_video_formats", StringComparer.OrdinalIgnoreCase) ? "requested" : "offered unprompted")}), "
+            + $"wfdx={_displayCapabilities.ExtendedVideoFormats} "
+            + $"({(requested.Contains("wfdx_video_formats", StringComparer.OrdinalIgnoreCase) ? "requested" : "offered unprompted")}), "
             + $"WFD2={(requestsWfd2Video ? _displayCapabilities.Wfd2VideoFormats : "not requested")}, "
             + $"EDID={(_displayCapabilities.HasEdid && requested.Contains("wfd_display_edid", StringComparer.OrdinalIgnoreCase) ? "sent" : "not requested")}.");
         await _rtsp.SendResponseAsync(request, body: body, cancellationToken: cancellationToken)
@@ -362,7 +379,7 @@ internal sealed class WfdSession : IAsyncDisposable
     private static Dictionary<string, string> ParseParameters(string body)
     {
         var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var line in body.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        foreach (var line in body.Split((char[])['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             var separator = line.IndexOf(':');
             if (separator > 0)

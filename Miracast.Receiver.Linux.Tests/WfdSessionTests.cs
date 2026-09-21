@@ -196,12 +196,19 @@ public sealed class WfdSessionTests
             Assert.Contains("wfd2_video_formats: 60 01 01 0080 ", m3Response.Body);
             Assert.Contains("wfd2_audio_codecs: LPCM 00000002 00", m3Response.Body);
             Assert.Contains("wfd_display_edid: 0002 ", m3Response.Body);
+
+            // wfd2_video_formats has no custom-resolution field (its CEA/VESA
+            // tables top out at 4096x2160), so the sink must volunteer the
+            // arbitrary-resolution parameters even though this WFD2 Source
+            // never asked for them by name in the M3 request.
+            Assert.Contains("wfdx_video_formats: 0098 01 ", m3Response.Body);
+            Assert.Contains("microsoft_custom_video_formats: 1e00 05a0 001e", m3Response.Body);
         }
         else
         {
             Assert.Matches(@"wfd_video_formats: [0-9a-f]{2} 01 ", m3Response.Body);
         }
-        Assert.Contains("microsoft_video_formats: 000000000000", m3Response.Body);
+        Assert.Contains("microsoft_video_formats: none", m3Response.Body);
 
         if (customWidth is not null && customHeight is not null)
         {

@@ -87,7 +87,16 @@ internal sealed class WfdDisplayCapabilities
     public string MicrosoftCustomVideoFormats =>
         $"{Width:x4} {Height:x4} {FrameRate:x4}";
 
-    public string MicrosoftVideoFormats => $"{BuildMicrosoftVideoFormatMask():x12}";
+    // "none" rather than an all-zero mask, so Windows treats the fixed
+    // Surface-shaped table as unsupported instead of an empty ceiling.
+    public string MicrosoftVideoFormats
+    {
+        get
+        {
+            var mask = BuildMicrosoftVideoFormatMask();
+            return mask == 0 ? "none" : $"{mask:x12}";
+        }
+    }
 
     public string DisplayEdid => _edid is null
         ? "none"
