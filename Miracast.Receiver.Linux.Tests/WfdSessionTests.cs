@@ -26,7 +26,12 @@ public sealed class WfdSessionTests
         var renderer = new FakeRenderer();
         var mediaReady = new TaskCompletionSource<VideoSource>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        await using var session = new WfdSession(context, renderer, mediaReady.SetResult, _ => { });
+        await using var session = new WfdSession(
+            context,
+            renderer,
+            mediaReady.SetResult,
+            _ => { },
+            new WfdDisplayCapabilities(1280, 720));
         await session.RunAsync(timeout.Token);
         var negotiatedRtpPort = await sourceTask;
 
@@ -40,7 +45,115 @@ public sealed class WfdSessionTests
         listener.Stop();
     }
 
-    private static async Task<int> RunFakeWfdSourceAsync(TcpListener listener, CancellationToken cancellationToken)
+    [Fact]
+    public async Task UsesExactCustomWallModeSelectedBySource()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var endpoint = (IPEndPoint)listener.LocalEndpoint;
+        var sourceTask = RunFakeWfdSourceAsync(listener, timeout.Token, 3840, 1080);
+
+        var peer = new WifiP2PPeer(
+            new ObjectPath("/test/peer"), "Test Source", "02:00:00:00:00:01", 100, [1]);
+        var context = new P2PConnectionContext(
+            peer, "p2p-test", IPAddress.Loopback, IPAddress.Loopback, endpoint.Port);
+        var renderer = new FakeRenderer();
+        var mediaReady = new TaskCompletionSource<VideoSource>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await using var session = new WfdSession(
+            context,
+            renderer,
+            mediaReady.SetResult,
+            _ => { },
+            new WfdDisplayCapabilities(3840, 1080));
+        await session.RunAsync(timeout.Token);
+        var negotiatedRtpPort = await sourceTask;
+
+        var source = await mediaReady.Task.WaitAsync(timeout.Token);
+        Assert.Equal(3840, source.Width);
+        Assert.Equal(1080, source.Height);
+        Assert.Equal(negotiatedRtpPort, source.StreamUri.Port);
+        listener.Stop();
+    }
+
+    [Fact]
+    public async Task UsesExactPreferredDisplayModeSelectedFromEdid()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var endpoint = (IPEndPoint)listener.LocalEndpoint;
+        var sourceTask = RunFakeWfdSourceAsync(
+            listener,
+            timeout.Token,
+            3840,
+            1080,
+            selectPreferredDisplayMode: true);
+
+        var peer = new WifiP2PPeer(
+            new ObjectPath("/test/peer"), "Test Source", "02:00:00:00:00:01", 100, [1]);
+        var context = new P2PConnectionContext(
+            peer, "p2p-test", IPAddress.Loopback, IPAddress.Loopback, endpoint.Port);
+        var renderer = new FakeRenderer();
+        var mediaReady = new TaskCompletionSource<VideoSource>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await using var session = new WfdSession(
+            context,
+            renderer,
+            mediaReady.SetResult,
+            _ => { },
+            new WfdDisplayCapabilities(3840, 1080));
+        await session.RunAsync(timeout.Token);
+        await sourceTask;
+
+        var source = await mediaReady.Task.WaitAsync(timeout.Token);
+        Assert.Equal(3840, source.Width);
+        Assert.Equal(1080, source.Height);
+        listener.Stop();
+    }
+
+    [Fact]
+    public async Task NegotiatesAndAppliesWfd2VideoFormat()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var endpoint = (IPEndPoint)listener.LocalEndpoint;
+        var sourceTask = RunFakeWfdSourceAsync(
+            listener,
+            timeout.Token,
+            selectWfd2VideoFormat: true);
+
+        var peer = new WifiP2PPeer(
+            new ObjectPath("/test/peer"), "Test Source", "02:00:00:00:00:01", 100, [1]);
+        var context = new P2PConnectionContext(
+            peer, "p2p-test", IPAddress.Loopback, IPAddress.Loopback, endpoint.Port);
+        var renderer = new FakeRenderer();
+        var mediaReady = new TaskCompletionSource<VideoSource>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await using var session = new WfdSession(
+            context,
+            renderer,
+            mediaReady.SetResult,
+            _ => { },
+            new WfdDisplayCapabilities(7680, 1440, 2560, 1440));
+        await session.RunAsync(timeout.Token);
+        await sourceTask;
+
+        var source = await mediaReady.Task.WaitAsync(timeout.Token);
+        Assert.Equal(2560, source.Width);
+        Assert.Equal(1440, source.Height);
+        listener.Stop();
+    }
+
+    private static async Task<int> RunFakeWfdSourceAsync(
+        TcpListener listener,
+        CancellationToken cancellationToken,
+        int? customWidth = null,
+        int? customHeight = null,
+        bool selectPreferredDisplayMode = false,
+        bool selectWfd2VideoFormat = false)
     {
         using var tcp = await listener.AcceptTcpClientAsync(cancellationToken);
         await using var stream = tcp.GetStream();
@@ -59,18 +172,71 @@ public sealed class WfdSessionTests
         await SendResponseAsync(writer, reciprocalOptions.CSeq!.Value, null, null, cancellationToken);
 
         var m3Body = "wfd_content_protection\r\nwfd_video_formats\r\nwfd_audio_codecs\r\n"
-            + "wfd_client_rtp_ports\r\nwfd_uibc_capability\r\n";
+            + "wfd_client_rtp_ports\r\nwfd_uibc_capability\r\nmicrosoft_video_formats\r\n";
+        if (customWidth is not null && customHeight is not null)
+        {
+            m3Body += "wfdx_video_formats\r\nmicrosoft_custom_video_formats\r\n"
+                + "wfd_display_edid\r\n";
+        }
+        if (selectWfd2VideoFormat)
+        {
+            m3Body += "wfd2_video_formats\r\nwfd2_audio_codecs\r\n"
+                + "wfd_display_edid\r\n";
+        }
         await SendRequestAsync(writer, "GET_PARAMETER", "rtsp://localhost/wfd1.0", 2, m3Body, cancellationToken);
         var m3Response = await ReadResponseAsync(reader, cancellationToken);
         var portMatch = Regex.Match(m3Response.Body, @"RTP/AVP/UDP;unicast\s+(\d+)");
         Assert.True(portMatch.Success);
         var rtpPort = int.Parse(portMatch.Groups[1].Value);
         Assert.Contains("wfd_content_protection: none", m3Response.Body);
+        if (selectWfd2VideoFormat)
+        {
+            Assert.DoesNotContain("wfd_video_formats:", m3Response.Body);
+            Assert.DoesNotContain("wfd_audio_codecs:", m3Response.Body);
+            Assert.Contains("wfd2_video_formats: 60 01 01 0080 ", m3Response.Body);
+            Assert.Contains("wfd2_audio_codecs: LPCM 00000002 00", m3Response.Body);
+            Assert.Contains("wfd_display_edid: 0002 ", m3Response.Body);
+        }
+        else
+        {
+            Assert.Matches(@"wfd_video_formats: [0-9a-f]{2} 01 ", m3Response.Body);
+        }
+        Assert.Contains("microsoft_video_formats: 000000000000", m3Response.Body);
+
+        if (customWidth is not null && customHeight is not null)
+        {
+            Assert.Contains(
+                $"microsoft_custom_video_formats: {customWidth.Value:x4} {customHeight.Value:x4} 001e",
+                m3Response.Body);
+            Assert.Contains("wfdx_video_formats: 0098 01 ", m3Response.Body);
+            Assert.Contains("wfd_display_edid: 0001 ", m3Response.Body);
+        }
 
         var m4Body = "wfd_content_protection: none\r\n"
-            + "wfd_video_formats: 00 00 02 10 00000080 00000000 00000000 00 0000 0000 00 none none\r\n"
             + "wfd_audio_codecs: LPCM 00000002 00\r\n"
             + "wfd_presentation_URL: rtsp://127.0.0.1/wfd1.0/streamid=0 none\r\n";
+        if (selectWfd2VideoFormat)
+        {
+            // VESA bit 30 selects 2560x1440p30 in WFD2 Table 72.
+            m4Body += "wfd2_video_formats: 00 01 02 0040 000000000000 "
+                + "000040000000 000000000000 00 0000 0000 00 00\r\n";
+        }
+        else if (selectPreferredDisplayMode)
+        {
+            m4Body += "wfd_preferred_display_mode: 003373 0f00 0050 8008 0020 "
+                + "0438 0028 8003 0008 00 00 08 02 10 00000000 00000000 "
+                + "00000000 00 0000 0000 00 none none\r\n";
+        }
+        else
+        {
+            m4Body += "wfd_video_formats: 00 00 02 10 00000080 00000000 "
+                + "00000000 00 0000 0000 00 none none\r\n";
+        }
+        if (!selectPreferredDisplayMode && customWidth is not null && customHeight is not null)
+        {
+            m4Body += $"microsoft_custom_video_formats: {customWidth.Value:x4} "
+                + $"{customHeight.Value:x4} 001e\r\n";
+        }
         await SendRequestAsync(writer, "SET_PARAMETER", "rtsp://localhost/wfd1.0", 3, m4Body, cancellationToken);
         Assert.Equal(200, (await ReadResponseAsync(reader, cancellationToken)).StatusCode);
 

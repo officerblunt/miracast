@@ -290,10 +290,12 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             _authorizedPeerAddress = normalizedAddress;
             _authorizedPeer = peer;
             _authorizationExpiresAt = DateTime.MaxValue;
-            // AddAndActivateConnection2/P2P_CONNECT stops an active find itself.
-            // Sending an explicit StopFind while the driver has a scan pending
-            // can be queued by wpa_supplicant and delay WPS for several minutes.
+            // AddAndActivateConnection2/P2P_CONNECT stops an active Find, but it
+            // does not disable Extended Listen. Leaving Extended Listen enabled
+            // lets a single radio return to its listen channel while the group
+            // interface is authenticating on the negotiated operating channel.
             _discovery.Pause();
+            await StopListeningAsync(attemptToken).ConfigureAwait(false);
             await WaitForPendingScanAsync(attemptToken).ConfigureAwait(false);
             await ConfigureConcurrentWifiChannelAsync(attemptToken).ConfigureAwait(false);
             Report(

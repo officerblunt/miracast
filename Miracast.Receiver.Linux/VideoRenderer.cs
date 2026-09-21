@@ -126,17 +126,36 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
             "-q",
             "udpsrc", $"address={source.StreamUri.Host}", $"port={source.StreamUri.Port}",
             "caps=application/x-rtp,media=video,clock-rate=90000,encoding-name=MP2T,payload=33",
-            "!", "rtpjitterbuffer", "latency=100", "drop-on-latency=true", "do-lost=true",
+            // The jitter buffer is the only intentional network latency in the
+            // video path.  Do not let it evict complete RTP/TS buffers merely
+            // because the downstream decoder was briefly busy: losing an
+            // arbitrary H.264 reference frame corrupts every dependent frame.
+            "!", "rtpjitterbuffer", "latency=100", "drop-on-latency=false", "do-lost=true",
             "!", "rtpmp2tdepay",
-            "!", "tsdemux", "name=demux",
-            "demux.", "!", "queue", "max-size-buffers=3", "max-size-bytes=0", "max-size-time=0", "leaky=downstream",
+            // tsdemux otherwise adds 700 ms of its own smoothing latency.  RTP
+            // jitter has already been handled above, so a second large buffer
+            // only makes screen interaction visibly lag behind the Source.
+            "!", "tsdemux", "latency=0", "name=demux",
+            // Never shed encoded H.264 buffers.  Frames in a GOP depend on one
+            // another, so dropping here produces undecodable/corrupt pictures
+            // until the Source emits another IDR frame.
+            "demux.", "!", "queue", "max-size-buffers=0", "max-size-bytes=0",
+            "max-size-time=200000000",
             // Keep Miracast decoding away from the desktop GPU. An auto-selected
             // VAAPI decoder can leave the display stack wedged when a wireless
             // source disappears while the decoder is being torn down.
             "!", "h264parse", "!", "avdec_h264",
             "!", "videoconvert", "!", "videoscale",
             "!", $"video/x-raw,format=BGRA,width={source.Width},height={source.Height}",
-            "!", "fdsink", "fd=1", "sync=true",
+            // Once a frame is fully decoded it is independent and safe to
+            // discard.  Keep only the newest raw frame if the IPC consumer is
+            // momentarily slower than the decoder, instead of accumulating lag.
+            "!", "queue", "max-size-buffers=1", "max-size-bytes=0",
+            "max-size-time=0", "leaky=downstream",
+            // stdout is a transport, not a presentation device.  Scheduling it
+            // against the media clock adds avoidable delay before MultiWall's
+            // own presentation timer.
+            "!", "fdsink", "fd=1", "sync=false", "async=false",
         ];
         arguments.AddRange(
         [

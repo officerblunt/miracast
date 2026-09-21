@@ -13,7 +13,15 @@ internal static class Program
         try
         {
             var pipeName = GetRequiredArgument(args, "--pipe");
-            var (receiver, renderer) = CreatePlatformReceiver();
+            var displayWidth = GetRequiredPositiveIntegerArgument(args, "--display-width");
+            var displayHeight = GetRequiredPositiveIntegerArgument(args, "--display-height");
+            var nativeWidth = GetRequiredPositiveIntegerArgument(args, "--native-width");
+            var nativeHeight = GetRequiredPositiveIntegerArgument(args, "--native-height");
+            var (receiver, renderer) = CreatePlatformReceiver(
+                displayWidth,
+                displayHeight,
+                nativeWidth,
+                nativeHeight);
             await using var worker = new ReceiverWorker(pipeName, receiver, renderer);
             await worker.RunAsync().ConfigureAwait(false);
             return 0;
@@ -37,7 +45,19 @@ internal static class Program
         throw new ArgumentException($"Required argument '{name}' was not provided.", name);
     }
 
-    private static (IMiracastReceiverService Receiver, IVideoRenderer Renderer) CreatePlatformReceiver()
+    private static int GetRequiredPositiveIntegerArgument(IReadOnlyList<string> args, string name)
+    {
+        var value = GetRequiredArgument(args, name);
+        return int.TryParse(value, out var result) && result is > 0 and <= ushort.MaxValue
+            ? result
+            : throw new ArgumentOutOfRangeException(name, value, "Display dimensions must be between 1 and 65535.");
+    }
+
+    private static (IMiracastReceiverService Receiver, IVideoRenderer Renderer) CreatePlatformReceiver(
+        int displayWidth,
+        int displayHeight,
+        int nativeWidth,
+        int nativeHeight)
     {
 #if WINDOWS_WORKER
         if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 18362))
@@ -49,7 +69,14 @@ internal static class Program
         if (!OperatingSystem.IsLinux())
             throw new PlatformNotSupportedException("The Linux receiver can only run on Linux.");
         var renderer = new Miracast.Receiver.Linux.VideoRenderer();
-        return (new Miracast.Receiver.Linux.MiracastReceiverService(renderer), renderer);
+        return (
+            new Miracast.Receiver.Linux.MiracastReceiverService(
+                renderer,
+                displayWidth,
+                displayHeight,
+                nativeWidth,
+                nativeHeight),
+            renderer);
 #else
         throw new PlatformNotSupportedException("The Miracast receiver supports Windows and Linux only.");
 #endif

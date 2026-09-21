@@ -9,6 +9,7 @@ public sealed class MiracastReceiverService :
 {
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private readonly IVideoRenderer _videoRenderer;
+    private readonly WfdDisplayCapabilities _displayCapabilities;
     private NetworkManagerP2P? _networkManager;
     private WfdSession? _wfdSession;
     private Task? _sessionTask;
@@ -16,7 +17,20 @@ public sealed class MiracastReceiverService :
     private WifiP2PPeer? _connectedPeer;
     private bool _started;
 
-    public MiracastReceiverService(IVideoRenderer videoRenderer) => _videoRenderer = videoRenderer;
+    public MiracastReceiverService(
+        IVideoRenderer videoRenderer,
+        int displayWidth = 1920,
+        int displayHeight = 1080,
+        int? nativeWidth = null,
+        int? nativeHeight = null)
+    {
+        _videoRenderer = videoRenderer;
+        _displayCapabilities = new WfdDisplayCapabilities(
+            displayWidth,
+            displayHeight,
+            nativeWidth,
+            nativeHeight);
+    }
 
     public event EventHandler<ConnectionCreatedEventArgs>? ConnectionCreated;
     public event EventHandler<ConnectionClosedEventArgs>? ConnectionClosed;
@@ -119,7 +133,12 @@ public sealed class MiracastReceiverService :
 
     private async Task RunWfdSessionAsync(P2PConnectionContext connection, CancellationToken cancellationToken)
     {
-        var session = new WfdSession(connection, _videoRenderer, OnMediaReady, Report);
+        var session = new WfdSession(
+            connection,
+            _videoRenderer,
+            OnMediaReady,
+            Report,
+            _displayCapabilities);
         _wfdSession = session;
         try
         {
