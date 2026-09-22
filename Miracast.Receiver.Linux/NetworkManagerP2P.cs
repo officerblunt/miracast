@@ -16,13 +16,17 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
     private const uint DeviceStateFailed = 120;
     private const int P2PExtendedListenPeriodMilliseconds = 500;
     private const int P2PExtendedListenIntervalMilliseconds = 2000;
+    private const int P2PBoostedListenPeriodMilliseconds = 1500;
+    private const int P2PBoostedListenIntervalMilliseconds = 2000;
     private static readonly TimeSpan ConnectionAttemptTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan PeerDiscoveryBoostDuration = TimeSpan.FromSeconds(30);
     private readonly Connection _bus = new(Address.System);
     private readonly PeerOperationCoalescer _authorizationOperations = new();
     private readonly PeerOperationCoalescer _disconnectionOperations = new();
     private readonly SemaphoreSlim _authorizationGate = new(1, 1);
     private readonly SemaphoreSlim _discoveryGate = new(1, 1);
     private readonly P2PDiscoveryScheduler _discovery;
+    private readonly P2PListenAvailability _listenAvailability;
     private readonly List<IDisposable> _subscriptions = [];
     private readonly ConcurrentDictionary<string, WifiP2PPeer> _peersByAddress =
         new(StringComparer.OrdinalIgnoreCase);
@@ -83,6 +87,15 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             () => _authorizationExpiresAt,
             StartDiscoveryAsync,
             Report);
+        _listenAvailability = new P2PListenAvailability(
+            () => _discovery.Enabled
+                  && _discovery.IsListening
+                  && !_connecting
+                  && _groupP2PDevice is null
+                  && _supplicantP2PDevice is not null,
+            ApplyListenModeAsync,
+            Report,
+            PeerDiscoveryBoostDuration);
     }
 
     public async Task StartAsync(CancellationToken cancellationToken)
@@ -174,6 +187,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         // startup must not wait for it: discovery will begin as soon as the
         // adapter becomes available.
         Report("Miracast receiver initialized. Starting Wi-Fi Direct discovery in the background…");
+        _listenAvailability.Start(_lifetime.Token);
         _discovery.Start(_lifetime.Token, "the receiver started");
 
         var peers = await _p2pDevice.GetAsync<ObjectPath[]>("Peers")
@@ -210,6 +224,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
             PeerAvailable?.Invoke(this, peer);
             if (!_connecting)
                 Report($"Found {peer.Name} ({peer.HardwareAddress}), signal {peer.Strength}%.");
+            _listenAvailability.Boost(peer.Name);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -502,6 +517,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         _peersByAddress.Clear();
         _peerAddressesByPath.Clear();
         await RestoreWfdAdvertisementAsync(cleanupToken).ConfigureAwait(false);
+        await _listenAvailability.StopAsync().ConfigureAwait(false);
         _initialP2PResetCompleted = false;
         _authorizationExpiresAt = DateTime.MinValue;
         _authorizedPeerAddress = null;
@@ -775,7 +791,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
                         await ResetStaleP2PStateAsync(p2pDevice, cancellationToken).ConfigureAwait(false);
                         _initialP2PResetCompleted = true;
                     }
-                    await StartSupplicantListenAsync(p2pDevice, cancellationToken).ConfigureAwait(false);
+                    await StartSupplicantListenAsync(cancellationToken).ConfigureAwait(false);
                     _initialP2PResetCompleted = true;
                     // Bounded Listen mode keeps the Sink discoverable without
                     // active Search scans or starving the connected STA link.
@@ -819,20 +835,43 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         }
     }
 
-    private async Task StartSupplicantListenAsync(
-        IWpaP2PDevice p2pDevice,
-        CancellationToken cancellationToken)
+    private async Task StartSupplicantListenAsync(CancellationToken cancellationToken)
     {
         // Extended Listen is scheduled by wpa_supplicant itself. The radio is
         // discoverable for a bounded period and returns to the connected STA
         // between periods, without relying on a one-shot Listen completion
         // signal that some drivers never emit over D-Bus.
-        await p2pDevice.ExtendedListenAsync(new Dictionary<string, object>
+        await _listenAvailability.ApplyNormalAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private Task ApplyListenModeAsync(
+        P2PListenMode mode,
+        CancellationToken cancellationToken)
+    {
+        var p2pDevice = _supplicantP2PDevice;
+        if (p2pDevice is null)
+        {
+            return mode == P2PListenMode.Disabled
+                ? Task.CompletedTask
+                : Task.FromException(new InvalidOperationException(
+                    "The wpa_supplicant P2PDevice proxy is not available."));
+        }
+
+        IDictionary<string, object> options = mode switch
+        {
+            P2PListenMode.Normal => new Dictionary<string, object>
             {
                 ["period"] = P2PExtendedListenPeriodMilliseconds,
                 ["interval"] = P2PExtendedListenIntervalMilliseconds,
-            })
-            .WaitAsync(cancellationToken).ConfigureAwait(false);
+            },
+            P2PListenMode.Boosted => new Dictionary<string, object>
+            {
+                ["period"] = P2PBoostedListenPeriodMilliseconds,
+                ["interval"] = P2PBoostedListenIntervalMilliseconds,
+            },
+            _ => new Dictionary<string, object>(),
+        };
+        return p2pDevice.ExtendedListenAsync(options).WaitAsync(cancellationToken);
     }
 
     private async Task ConfigureWfdAdvertisementAsync(CancellationToken cancellationToken)
@@ -1518,8 +1557,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         {
             try
             {
-                await _supplicantP2PDevice.ExtendedListenAsync(new Dictionary<string, object>())
-                    .WaitAsync(cancellationToken).ConfigureAwait(false);
+                await _listenAvailability.DisableAsync(cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
             catch (DBusException) { }
@@ -1538,6 +1576,7 @@ internal sealed class NetworkManagerP2P : IAsyncDisposable
         await StopAsync().ConfigureAwait(false);
         _authorizationGate.Dispose();
         _discoveryGate.Dispose();
+        _listenAvailability.Dispose();
         _bus.Dispose();
     }
 }
