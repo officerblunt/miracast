@@ -53,6 +53,11 @@ internal static class P2PNetworkConfiguration
             ["DeviceName"] = receiverName,
             ["PrimaryDeviceType"] = DisplayPrimaryDeviceType,
             ["GOIntent"] = 0u,
+            // Windows reinvokes the group that it created for the previous
+            // projection before it will try fresh WPS. Keep that credential
+            // usable; NetworkManager is primed for the known peer as soon as
+            // it becomes visible so it can adopt GroupStarted and own IP.
+            ["PersistentReconnect"] = true,
             // Keep regular STA Wi-Fi on the physical interface and create a
             // dedicated group interface for concurrent P2P operation.
             ["NoGroupIface"] = false,

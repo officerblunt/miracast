@@ -7,15 +7,22 @@ public interface IWpaSupplicant : IDBusObject
 {
     Task<T> GetAsync<T>(string property);
     Task SetAsync(string property, object value);
+    Task RemoveInterfaceAsync(ObjectPath path);
+    Task<IDisposable> WatchInterfaceAddedAsync(
+        Action<(ObjectPath path, IDictionary<string, object> properties)> handler,
+        Action<Exception>? onError = null);
 }
 
 [DBusInterface("fi.w1.wpa_supplicant1.Interface.P2PDevice")]
 public interface IWpaP2PDevice : IDBusObject
 {
-    Task ExtendedListenAsync(IDictionary<string, object> options);
+    Task FindAsync(IDictionary<string, object> options);
+    Task ListenAsync(int timeout);
     Task StopFindAsync();
     Task CancelAsync();
     Task FlushAsync();
+    Task<ObjectPath> AddPersistentGroupAsync(IDictionary<string, object> properties);
+    Task RemoveAllPersistentGroupsAsync();
     Task DisconnectAsync();
     Task<T> GetAsync<T>(string property);
     Task SetAsync(string property, object value);
@@ -40,6 +47,9 @@ public interface IWpaP2PDevice : IDBusObject
     Task<IDisposable> WatchProvisionDiscoveryFailureAsync(
         Action<(ObjectPath peer, int status)> handler,
         Action<Exception>? onError = null);
+    Task<IDisposable> WatchInvitationReceivedAsync(
+        Action<IDictionary<string, object>> handler,
+        Action<Exception>? onError = null);
     Task<IDisposable> WatchGONegotiationRequestAsync(
         Action<(ObjectPath path, ushort devicePasswordId, byte deviceGoIntent)> handler,
         Action<Exception>? onError = null);
@@ -58,6 +68,9 @@ public interface IWpaP2PDevice : IDBusObject
     Task<IDisposable> WatchGroupFinishedAsync(
         Action<IDictionary<string, object>> handler,
         Action<Exception>? onError = null);
+    Task<IDisposable> WatchFindStoppedAsync(
+        Action handler,
+        Action<Exception>? onError = null);
 }
 
 [DBusInterface("fi.w1.wpa_supplicant1.Interface.WPS")]
@@ -70,11 +83,18 @@ public interface IWpaWps : IDBusObject
 [DBusInterface("fi.w1.wpa_supplicant1.Interface")]
 public interface IWpaInterface : IDBusObject
 {
+    Task DisconnectAsync();
     Task<T> GetAsync<T>(string property);
 }
 
 [DBusInterface("fi.w1.wpa_supplicant1.Peer")]
 public interface IWpaPeer : IDBusObject
+{
+    Task<T> GetAsync<T>(string property);
+}
+
+[DBusInterface("fi.w1.wpa_supplicant1.PersistentGroup")]
+public interface IWpaPersistentGroup : IDBusObject
 {
     Task<T> GetAsync<T>(string property);
 }

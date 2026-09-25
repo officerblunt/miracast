@@ -27,7 +27,7 @@ public sealed class MiracastReceiverService : IMiracastReceiverService, IAsyncDi
             cancellationToken.ThrowIfCancellationRequested();
             var receiver = new MiracastReceiver();
             var settings = receiver.GetDefaultSettings();
-            settings.FriendlyName = $"{Environment.MachineName} Miracast";
+            settings.FriendlyName = ReceiverName.Resolve();
             settings.AuthorizationMethod = MiracastReceiverAuthorizationMethod.None;
             settings.RequireAuthorizationFromKnownTransmitters = false;
 

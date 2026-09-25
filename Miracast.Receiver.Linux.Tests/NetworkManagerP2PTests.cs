@@ -49,6 +49,37 @@ public sealed class NetworkManagerP2PTests
     }
 
     [Theory]
+    [InlineData("p2p-11", true)]
+    [InlineData("p2p-wlan0-1", true)]
+    [InlineData("p2p-dev-wlan0", false)]
+    [InlineData("p2p-11;reboot", false)]
+    [InlineData("../p2p-11", false)]
+    public void AcceptsOnlySafeP2PKernelInterfaceNames(string name, bool expected)
+    {
+        Assert.Equal(expected, P2PAddressing.IsSafeKernelInterfaceName(name));
+    }
+
+    [Fact]
+    public void CopiesOnlyPropertiesRequiredToRestorePersistentGroup()
+    {
+        var properties = new Dictionary<string, object>
+        {
+            ["bssid"] = "42:AE:30:AB:8C:A2",
+            ["ssid"] = "DIRECT-test",
+            ["psk"] = "secret",
+            ["disabled"] = "2",
+            ["mode"] = "0",
+            ["unrelated"] = "ignored",
+        };
+
+        var copy = P2PAddressing.CopyPersistentGroupProperties(properties);
+
+        Assert.Equal(4, copy.Count);
+        Assert.DoesNotContain("disabled", copy.Keys);
+        Assert.DoesNotContain("unrelated", copy.Keys);
+    }
+
+    [Theory]
     [InlineData("/", false)]
     [InlineData("/fi/w1/wpa_supplicant1/Interfaces/21/Groups/AB", true)]
     public void TrustsOnlyAnExplicitSupplicantGroupPath(string path, bool expected)
@@ -70,6 +101,17 @@ public sealed class NetworkManagerP2PTests
     }
 
     [Theory]
+    [InlineData(new byte[] { 0, 0, 6, 0, 0x10, 0x1c, 0x44, 0, 0xc8 }, true)]
+    [InlineData(new byte[] { 0, 0, 6, 0, 0x13, 0x1c, 0x44, 0, 0xc8 }, true)]
+    [InlineData(new byte[] { 0, 0, 6, 0, 0x11, 0x1c, 0x44, 0, 0xc8 }, false)]
+    [InlineData(new byte[] { 0, 0, 6, 0, 0x12, 0x1c, 0x44, 0, 0xc8 }, false)]
+    [InlineData(new byte[] { 0, 0, 6, 0 }, false)]
+    public void IdentifiesOnlyWfdSourceCapablePeers(byte[] informationElements, bool expected)
+    {
+        Assert.Equal(expected, P2PAddressing.IsWfdSource(informationElements));
+    }
+
+    [Theory]
     [InlineData(null)]
     [InlineData(new byte[] { 0, 0, 0, 0 })]
     [InlineData(new byte[] { 192, 168, 49 })]
@@ -80,6 +122,51 @@ public sealed class NetworkManagerP2PTests
             properties["IpAddr"] = value;
 
         Assert.Null(P2PAddressing.GetGroupAddress(properties, "IpAddr"));
+    }
+
+    [Fact]
+    public void GetsInvitationSourceAddressWithGoAddressFallback()
+    {
+        var sourceProperties = new Dictionary<string, object>
+        {
+            ["sa"] = new byte[] { 0x00, 0x45, 0xe2, 0x6c, 0x84, 0x5b },
+            ["go_dev_addr"] = new byte[] { 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 },
+        };
+        var goProperties = new Dictionary<string, object>
+        {
+            ["go_dev_addr"] = new byte[] { 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 },
+        };
+
+        Assert.Equal(
+            "0045E26C845B",
+            P2PAddressing.GetHardwareAddress(sourceProperties, "sa", "go_dev_addr"));
+        Assert.Equal(
+            "021122334455",
+            P2PAddressing.GetHardwareAddress(goProperties, "sa", "go_dev_addr"));
+    }
+
+    [Theory]
+    [InlineData("42:ae:30:ab:8c:a2")]
+    [InlineData("42AE30AB8CA2")]
+    public void GetsPersistentGroupBssid(string bssid)
+    {
+        var properties = new Dictionary<string, object> { ["bssid"] = bssid };
+
+        Assert.Equal(
+            "42AE30AB8CA2",
+            P2PAddressing.GetHardwareAddress(properties, "bssid"));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData(new byte[] { 0, 1, 2, 3, 4 })]
+    public void RejectsInvalidInvitationSourceAddress(byte[]? value)
+    {
+        var properties = new Dictionary<string, object>();
+        if (value is not null)
+            properties["sa"] = value;
+
+        Assert.Null(P2PAddressing.GetHardwareAddress(properties, "sa"));
     }
 
     [Theory]
@@ -153,6 +240,7 @@ public sealed class NetworkManagerP2PTests
         var configuration = P2PNetworkConfiguration.CreateDeviceConfiguration("Receiver");
 
         Assert.Equal(false, configuration["NoGroupIface"]);
+        Assert.Equal(true, configuration["PersistentReconnect"]);
     }
 
     [Theory]
