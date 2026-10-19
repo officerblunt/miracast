@@ -79,10 +79,20 @@ internal sealed class WfdDisplayCapabilities
         {
             var common = $"{BuildWfd2CeaMask():x12} {BuildWfd2VesaMask():x12} "
                 + $"{BuildWfd2HandheldMask():x12} 00 0000 0000 00";
+            // avdec_h264 also handles RHP2 (High Profile with CABAC), which
+            // Windows sources use. Include it explicitly in M3 negotiation.
             return $"{GetWfd2NativeMode():x2} 01 01 0080 {common}, "
-                + $"01 02 0080 {common} 00";
+                + $"01 02 0080 {common}, 01 04 0080 {common} 00";
         }
     }
+
+    // Video-only advertisement verified with MSMiracastSource on Windows 11.
+    // The generic tuple list makes that source time out at M3. Keep this
+    // compatibility list separate: EDID and the custom wall modes are still
+    // supplied independently, and other sources keep the generic capabilities.
+    public string WindowsWfd2VideoFormats =>
+        "40 01 04 0080 000001ffbdeb 00015fffffff 000000000fff 10 0000 001f 11, "
+        + "01 01 0080 000001ffbdeb 00015fffffff 000000000fff 10 0000 001f 11 00";
 
     public string MicrosoftCustomVideoFormats =>
         $"{Width:x4} {Height:x4} {FrameRate:x4}";

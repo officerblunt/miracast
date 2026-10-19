@@ -15,6 +15,8 @@ internal sealed class WfdSession : IAsyncDisposable
     private readonly TaskCompletionSource _m1Received = NewSignal();
     private readonly TaskCompletionSource _setupTriggered = NewSignal();
     private readonly TaskCompletionSource _sessionEnded = NewSignal();
+    private readonly TaskCompletionSource<bool> _windowsSource =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
     private RtpPortReservation? _ports;
     private string _presentationUrl = DefaultRtspUri;
     private string? _sessionId;
@@ -67,6 +69,9 @@ internal sealed class WfdSession : IAsyncDisposable
                 },
                 cancellationToken: token).ConfigureAwait(false);
             options.EnsureSuccess();
+            _windowsSource.TrySetResult(
+                options.Headers.TryGetValue("Server", out var server)
+                && server.StartsWith("MSMiracastSource/", StringComparison.OrdinalIgnoreCase));
             _report("WFD M1/M2 OPTIONS completed; waiting for capability negotiation…");
 
             await _setupTriggered.Task.WaitAsync(TimeSpan.FromSeconds(30), token).ConfigureAwait(false);
@@ -206,10 +211,16 @@ internal sealed class WfdSession : IAsyncDisposable
         _report($"WFD Source requested M3 capabilities: {string.Join(", ", requested)}.");
         var requestsWfd2Video = requested.Contains("wfd2_video_formats", StringComparer.OrdinalIgnoreCase);
         var requestsWfd2Audio = requested.Contains("wfd2_audio_codecs", StringComparer.OrdinalIgnoreCase);
+        // M3 can arrive immediately after the M2 response. Wait until its
+        // Server header has been processed before choosing the video list.
+        var windowsSource = await _windowsSource.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var wfd2VideoFormats = windowsSource
+            ? _displayCapabilities.WindowsWfd2VideoFormats
+            : _displayCapabilities.Wfd2VideoFormats;
         var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
             ["wfd_video_formats"] = _displayCapabilities.LegacyVideoFormats,
-            ["wfd2_video_formats"] = _displayCapabilities.Wfd2VideoFormats,
+            ["wfd2_video_formats"] = wfd2VideoFormats,
             ["wfdx_video_formats"] = _displayCapabilities.ExtendedVideoFormats,
             ["microsoft_video_formats"] = _displayCapabilities.MicrosoftVideoFormats,
             ["microsoft_custom_video_formats"] = _displayCapabilities.MicrosoftCustomVideoFormats,
@@ -219,6 +230,9 @@ internal sealed class WfdSession : IAsyncDisposable
             ["wfd_content_protection"] = "none",
             ["wfd_display_edid"] = _displayCapabilities.DisplayEdid,
             ["wfd_uibc_capability"] = "none",
+            // MS-WFDPE permits only 0 or 1 here, not the generic "none".
+            // WatchMediaAsync requests M13 when the first frame is missing.
+            ["wfd_idr_request_capability"] = "1",
             ["wfd_connector_type"] = "05",
             ["wfd_standby_resume_capability"] = "none",
         };
@@ -253,7 +267,8 @@ internal sealed class WfdSession : IAsyncDisposable
             + $"({(requested.Contains("microsoft_custom_video_formats", StringComparer.OrdinalIgnoreCase) ? "requested" : "offered unprompted")}), "
             + $"wfdx={_displayCapabilities.ExtendedVideoFormats} "
             + $"({(requested.Contains("wfdx_video_formats", StringComparer.OrdinalIgnoreCase) ? "requested" : "offered unprompted")}), "
-            + $"WFD2={(requestsWfd2Video ? _displayCapabilities.Wfd2VideoFormats : "not requested")}, "
+            + $"WFD2={(requestsWfd2Video ? wfd2VideoFormats : "not requested")}, "
+            + $"Windows compatibility={windowsSource}, "
             + $"EDID={(_displayCapabilities.HasEdid && requested.Contains("wfd_display_edid", StringComparer.OrdinalIgnoreCase) ? "sent" : "not requested")}.");
         await _rtsp.SendResponseAsync(request, body: body, cancellationToken: cancellationToken)
             .ConfigureAwait(false);
@@ -337,11 +352,23 @@ internal sealed class WfdSession : IAsyncDisposable
     private async Task WatchMediaAsync(CancellationToken cancellationToken)
     {
         var idrRequested = false;
+        var firstFrameReceived = false;
         while (!cancellationToken.IsCancellationRequested)
         {
             await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken).ConfigureAwait(false);
-            var lastFrame = (_renderer as VideoRenderer)?.LastFrameReceivedAt ?? _playStartedAt;
-            var silence = DateTimeOffset.UtcNow - lastFrame;
+            if ((_renderer as VideoRenderer)?.LastFrameReceivedAt is not null)
+            {
+                if (!firstFrameReceived)
+                {
+                    firstFrameReceived = true;
+                    _report("First Miracast video frame decoded; unchanged frames may be skipped by the Source.");
+                }
+                // WFD frame skipping can leave a static desktop unchanged
+                // indefinitely. After the first frame, RTSP/P2P disconnects
+                // own the session lifetime, not the arrival of a new picture.
+                continue;
+            }
+            var silence = DateTimeOffset.UtcNow - _playStartedAt;
             if (!idrRequested && silence >= TimeSpan.FromSeconds(4))
             {
                 idrRequested = true;
@@ -357,7 +384,7 @@ internal sealed class WfdSession : IAsyncDisposable
                     response.EnsureSuccess();
                     var rendererDiagnostic = (_renderer as VideoRenderer)?.DescribeNoFrames();
                     _report(
-                        "No decoded video frames received; requested a new IDR frame."
+                        "First decoded video frame has not arrived; requested an IDR frame."
                         + (rendererDiagnostic is null ? string.Empty : $" {rendererDiagnostic}"));
                 }
                 catch (Exception exception) when (exception is not OperationCanceledException)
@@ -370,7 +397,7 @@ internal sealed class WfdSession : IAsyncDisposable
             {
                 var rendererDiagnostic = (_renderer as VideoRenderer)?.DescribeNoFrames();
                 throw new TimeoutException(
-                    "No decoded RTP video frames were received for 12 seconds."
+                    "The first decoded RTP video frame was not received within 12 seconds."
                     + (rendererDiagnostic is null ? string.Empty : $" {rendererDiagnostic}"));
             }
         }

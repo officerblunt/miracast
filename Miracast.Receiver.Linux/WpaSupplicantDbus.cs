@@ -83,6 +83,7 @@ public interface IWpaWps : IDBusObject
 [DBusInterface("fi.w1.wpa_supplicant1.Interface")]
 public interface IWpaInterface : IDBusObject
 {
+    Task ScanAsync(IDictionary<string, object> args);
     Task DisconnectAsync();
     Task<T> GetAsync<T>(string property);
 }

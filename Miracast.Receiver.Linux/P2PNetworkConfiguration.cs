@@ -8,6 +8,15 @@ internal static class P2PNetworkConfiguration
     internal static readonly byte[] DisplayPrimaryDeviceType =
         [0x00, 0x07, 0x00, 0x50, 0xf2, 0x04, 0x00, 0x01];
 
+    internal static byte[][] CreateProbeRequestInformationElements() =>
+    [
+        // P2P Capability attribute; do not advertise optional device features
+        // on behalf of the adapter. Listen Channel is optional for this scan.
+        [0xdd, 0x09, 0x50, 0x6f, 0x9a, 0x09, 0x02, 0x02, 0x00, 0x00, 0x00],
+        [0xdd, (byte)(4 + SinkWfdInformationElements.Length), 0x50, 0x6f, 0x9a, 0x0a,
+            .. SinkWfdInformationElements],
+    ];
+
     internal static Dictionary<string, IDictionary<string, object>> CreateConnectionSettings(
         string peerName,
         string peerHardwareAddress) =>

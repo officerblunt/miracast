@@ -112,6 +112,7 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
 
     internal static ProcessStartInfo CreateGStreamerStartInfo(VideoSource source, bool decodeAudio)
     {
+        var conversionThreads = Math.Clamp(Environment.ProcessorCount, 1, 4);
         var info = new ProcessStartInfo("gst-launch-1.0")
         {
             UseShellExecute = false,
@@ -145,7 +146,13 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
             // VAAPI decoder can leave the display stack wedged when a wireless
             // source disappears while the decoder is being torn down.
             "!", "h264parse", "!", "avdec_h264",
-            "!", "videoconvert", "!", "videoscale",
+            // Decoding and BGRA conversion must run on separate streaming
+            // threads. Drop stale decoded frames before the expensive conversion
+            // instead of making the decoder wait for it at Full HD and above.
+            "!", "queue", "max-size-buffers=1", "max-size-bytes=0",
+            "max-size-time=0", "leaky=downstream",
+            "!", "videoconvert", $"n-threads={conversionThreads}",
+            "!", "videoscale", $"n-threads={conversionThreads}",
             "!", $"video/x-raw,format=BGRA,width={source.Width},height={source.Height}",
             // Once a frame is fully decoded it is independent and safe to
             // discard.  Keep only the newest raw frame if the IPC consumer is
@@ -161,7 +168,10 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
         [
             "demux.", "!", "queue", "max-size-buffers=12", "max-size-bytes=0",
             "max-size-time=0", "leaky=downstream",
-            "!", "audio/x-private2-lpcm",
+            // tsdemux exposes MPEG-TS LPCM, not the DVD private2 variant.
+            // A private2-only filter leaves this branch unlinked and its
+            // sink waiting for preroll, which can stall the video pipeline.
+            "!", "audio/x-private-ts-lpcm;audio/x-lpcm",
         ]);
         if (decodeAudio)
         {
@@ -175,7 +185,7 @@ public sealed class VideoRenderer : IVideoRenderer, IAsyncDisposable
         {
             // LPCM support is optional at runtime. An unhandled audio pad makes
             // decodebin terminate the whole pipeline, including valid H.264.
-            arguments.AddRange(["!", "fakesink", "sync=false"]);
+            arguments.AddRange(["!", "fakesink", "sync=false", "async=false"]);
         }
         foreach (var argument in arguments)
             info.ArgumentList.Add(argument);

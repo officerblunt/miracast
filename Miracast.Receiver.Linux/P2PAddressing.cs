@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net;
 using System.Net.NetworkInformation;
 using Tmds.DBus;
@@ -51,8 +52,30 @@ internal static class P2PAddressing
         var copy = new Dictionary<string, object>(StringComparer.Ordinal);
         foreach (var name in PersistentGroupPropertyNames)
         {
-            if (properties.TryGetValue(name, out var value))
-                copy[name] = value;
+            if (!properties.TryGetValue(name, out var value))
+                continue;
+
+            // The getter returns wpa_supplicant configuration syntax. The
+            // D-Bus setter quotes strings again, so replaying those values
+            // corrupts quoted SSIDs and treats a raw PSK as a passphrase.
+            if (value is string text)
+            {
+                if (name == "mode" && uint.TryParse(
+                        text, NumberStyles.None, CultureInfo.InvariantCulture, out var mode))
+                {
+                    value = mode;
+                }
+                else if (name is "ssid" or "psk")
+                {
+                    if (text.Length >= 2 && text[0] == '"' && text[^1] == '"')
+                        value = text[1..^1];
+                    else if ((name == "psk" ? text.Length == 64 : text.Length is > 0 and <= 64)
+                             && text.Length % 2 == 0 && text.All(char.IsAsciiHexDigit))
+                        value = Convert.FromHexString(text);
+                }
+            }
+
+            copy[name] = value;
         }
         return copy;
     }
